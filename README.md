@@ -39,6 +39,52 @@ MODEL-TYPE
 * Example configs in ```[config_dataset1.json/config_dataset2.json/config_dataset3.json]```
 * Additional options can be seen with `calodif-train --help`
 
+## Model Types
+
+Available model types:
+- `diffusion` - Standard diffusion model training
+- `layer` - Layer-based diffusion model
+- `meanflow` - MeanFlow diffusion model (with optional GMM prior)
+
+### MeanFlow Training
+
+Train a MeanFlow diffusion model using the standard CLI:
+
+**Pure MeanFlow (no GMM prior):**
+```bash
+calodif-train \
+    -d DATA-DIR \
+    -c CONFIG \
+    --checkpoint SAVE-DIR \
+    meanflow
+```
+
+**MeanFlow with GMM Prior:**
+```bash
+calodif-train \
+    -d DATA-DIR \
+    -c CONFIG \
+    --checkpoint SAVE-DIR \
+    --gmm-prior PATH/TO/gmm_prior.h5 \
+    meanflow
+```
+
+The MeanFlow training uses the same data loading pipeline as other models (no xy-mapping required). It automatically uses the standard preprocessing and data format specified in your config file.
+
+### GMM Prior Training
+
+To train a GMM prior for use with MeanFlow, use the standalone script:
+
+```bash
+python calodiffusion/train/gmm_hgcal.py \
+    --data_folder DATA-DIR \
+    --data_file your_data.h5 \
+    --nevts 10000 \
+    --out_prefix ckpt_gmm
+```
+
+This will generate a GMM prior H5 file that can be used with the `--gmm-prior` option in MeanFlow training.
+
 # Sampling with the learned model
 
 ```bash

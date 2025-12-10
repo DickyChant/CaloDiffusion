@@ -2,6 +2,7 @@ import click
 from calodiffusion.utils import utils
 from calodiffusion.train.train_diffusion import TrainDiffusion
 from calodiffusion.train.train_layer_model import TrainLayerModel
+from calodiffusion.train.train_meanflow import TrainMeanFlow
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -49,8 +50,9 @@ class dotdict(dict):
 )
 @click.option("--hgcal/--no-hgcal", default=None, is_flag=True, help="Use HGCal settings (overwrites config)")
 @click.option("--model-loc", default=None, help="Specify existing model to load")
+@click.option("--gmm-prior", default=None, help="Path to GMM prior H5 file (for MeanFlow with GMM)")
 @click.pass_context
-def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal): 
+def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal, gmm_prior): 
     ctx.ensure_object(dotdict)
 
     ctx.obj.config = utils.LoadJson(config)
@@ -65,6 +67,7 @@ def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, 
     ctx.obj.reset_training = reset_training
     ctx.obj.hgcal = hgcal
     ctx.obj.model_loc = model_loc
+    ctx.obj.gmm_prior = gmm_prior
 
     if hgcal is not None: 
         ctx.obj.config['HGCAL'] = hgcal
@@ -76,12 +79,14 @@ def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, 
 @train.command()
 @click.pass_context
 def diffusion(ctx): 
+    ctx.obj.model = "diffusion"
     TrainDiffusion(ctx.obj, ctx.obj.config).train()
 
 @train.command()
 @click.option("--layer-model-loc", default=None, help="Specify existing layer model to load")
 @click.pass_context
 def layer(ctx, layer_model_loc):
+    ctx.obj.model = "layer"
     if (layer_model_loc is not None) and ctx.obj.load: 
         ctx.obj.config['layer_model'] = layer_model_loc 
 
@@ -89,6 +94,14 @@ def layer(ctx, layer_model_loc):
     #sampler_algo = self.config.get("LAYER_SAMPLER", "DDim")
 
     TrainLayerModel(ctx.obj, ctx.obj.config).train()
+
+
+@train.command()
+@click.pass_context
+def meanflow(ctx):
+    """Train MeanFlow diffusion model (with optional GMM prior)."""
+    ctx.obj.model = "meanflow"
+    TrainMeanFlow(ctx.obj, ctx.obj.config).train()
 
 
 if __name__ == "__main__": 
