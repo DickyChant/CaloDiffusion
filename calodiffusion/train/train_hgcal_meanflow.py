@@ -2,6 +2,7 @@ import numpy as np
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 import argparse
+import h5py as h5
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +11,8 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
 from calodiffusion.utils import utils
-from calodiffusion.models.CaloDiffu import CaloDiffu
+from calodiffusion.utils import HGCal_utils
+from calodiffusion.models.calodiffusion import CaloDiffu
 
 
 if __name__ == '__main__':
@@ -73,41 +75,87 @@ if __name__ == '__main__':
     shower_embed = dataset_config.get('SHOWER_EMBED', '')
     orig_shape = ('orig' in shower_embed)
     energy_loss_scale = dataset_config.get('ENERGY_LOSS_SCALE', 0.0)
+    
+    # Check if pre-embedding is needed
+    pre_embed = ('pre-embed' in shower_embed) or ('NN' in shower_embed)
+    geom_file = dataset_config.get('BIN_FILE', '')
+    shower_scale = dataset_config.get('SHOWERSCALE', 200.0)
+    max_cells = dataset_config.get('MAX_CELLS', None)
+    
+    # Initialize HGCalConverter if pre-embedding is needed
+    NN_embed = None
+    if pre_embed:
+        trainable = dataset_config.get('TRAINABLE_EMBED', False)
+        NN_embed = HGCal_utils.HGCalConverter(
+            bins=dataset_config['SHAPE_FINAL'],
+            geom_file=geom_file,
+            trainable=trainable,
+            device=device,
+        ).to(device=device)
+        NN_embed.init(norm=True, dataset_num=dataset_num)
+        print(f"Initialized HGCalConverter for pre-embedding: {geom_file}", flush=True)
 
     data = []
     energies = []
     prior = [] if use_gmm else None
 
     for i, dataset in enumerate(dataset_config['FILES']):
+        # Load data
+        data_, gen_info_, layers_ = utils.DataLoader(
+            os.path.join(flags.data_folder,dataset),
+            hgcal=True,  # Use HGCal loader
+            shape=dataset_config['SHAPE_PAD'],
+            emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
+            nevts = flags.nevts,
+            max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
+            logE=dataset_config['logE'],
+            showerMap = dataset_config['SHOWERMAP'],
+            nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
+            dataset_num  = dataset_num,
+            orig_shape = orig_shape,
+            embed=pre_embed,
+            NN_embed=NN_embed,
+            config=dataset_config,
+            binning_file=geom_file,
+            shower_scale=shower_scale,
+            max_cells=max_cells,
+        )
+        # Extract energy from gen_info (first column)
+        e_ = gen_info_[:, 0] if gen_info_.ndim > 1 else gen_info_
+        
+        # Load GMM prior if needed
         if use_gmm:
-            data_, prior_, e_ = utils.DataLoader_GMM(
-                os.path.join(flags.data_folder,dataset),
-                flags.gmm_prior,
-                hgcal=True,  # Use HGCal loader
-                shape=dataset_config['SHAPE_PAD'],
-                emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
-                nevts = flags.nevts,
-                max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
-                logE=dataset_config['logE'],
-                showerMap = dataset_config['SHOWERMAP'],
-                nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
-                dataset_num  = dataset_num,
-                orig_shape = orig_shape,
+            # Load prior from H5 file
+            prior_file = flags.gmm_prior
+            if not os.path.exists(prior_file):
+                raise FileNotFoundError(f"GMM prior file not found: {prior_file}")
+            
+            with h5.File(prior_file, "r") as h5f:
+                # Load same number of events as data
+                n_events = data_.shape[0]
+                prior_raw = h5f["showers"][:n_events].astype(np.float32) * shower_scale
+            
+            # Process prior through same pipeline as data
+            # Get energies for preprocessing (use same as data)
+            e_prior = e_[:n_events] if len(e_) >= n_events else e_
+            
+            # Preprocess prior
+            prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                prior_raw,
+                e_prior,
+                dataset_config['SHAPE_PAD'],
+                dataset_config['SHOWERMAP'],
+                dataset_num=dataset_num,
+                orig_shape=orig_shape,
+                ecut=dataset_config.get('ECUT', 0),
+                max_deposit=dataset_config['MAXDEP'],
             )
-        else:
-            data_, e_ = utils.DataLoader(
-                os.path.join(flags.data_folder,dataset),
-                hgcal=True,  # Use HGCal loader
-                shape=dataset_config['SHAPE_PAD'],
-                emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
-                nevts = flags.nevts,
-                max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
-                logE=dataset_config['logE'],
-                showerMap = dataset_config['SHOWERMAP'],
-                nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
-                dataset_num  = dataset_num,
-                orig_shape = orig_shape,
-            )
+            
+            # Apply embedding if needed
+            if pre_embed and NN_embed is not None:
+                prior_preprocessed = NN_embed.enc_batches(torch.Tensor(prior_preprocessed)).cpu().numpy()
+            
+            prior_ = prior_preprocessed.astype(np.float32)
 
         if(i ==0): 
             data = data_
@@ -121,18 +169,62 @@ if __name__ == '__main__':
                 prior = np.concatenate((prior, prior_))
         
     avg_showers = std_showers = E_bins = None
-    NN_embed = None
+    # NN_embed already initialized above if pre_embed is True
 
-    dshape = dataset_config['SHAPE_PAD']
-    energies = np.reshape(energies,(-1))    
+    energies = np.reshape(energies,(-1))
+    
+    # Check current data shape
+    print(f"Data shape before reshape: {data.shape}")
+    print(f"Data size: {data.size}")
+    
+    dshape = dataset_config['SHAPE_PAD'].copy() if isinstance(dataset_config['SHAPE_PAD'], list) else list(dataset_config['SHAPE_PAD'])
+    
     if(not orig_shape): 
-        data = np.reshape(data,dshape)
+        # Calculate expected elements per sample (all dimensions except first)
+        expected_elements_per_sample = np.prod(dshape[1:])  # 1 * 47 * 12 * 21 = 11844
+        
+        # Calculate number of samples from total size
+        num_samples = data.size // expected_elements_per_sample
+        
+        print(f"Expected elements per sample: {expected_elements_per_sample}")
+        print(f"Calculated number of samples: {num_samples}")
+        print(f"Original target shape: {dshape}")
+        
+        # Replace -1 with calculated number of samples
+        if dshape[0] == -1:
+            dshape[0] = num_samples
+        
+        print(f"Final reshape target: {tuple(dshape)}")
+        print(f"Expected total size: {np.prod(dshape)}")
+        print(f"Actual data size: {data.size}")
+        
+        # Verify the reshape is possible
+        if data.size % expected_elements_per_sample != 0:
+            raise ValueError(
+                f"Cannot reshape data: array size {data.size} is not divisible by "
+                f"expected elements per sample {expected_elements_per_sample}. "
+                f"Data shape: {data.shape}, Target shape per sample: {tuple(dshape[1:])}"
+            )
+        
+        if data.size != np.prod(dshape):
+            # Try to reshape with -1 to let numpy figure it out
+            print(f"Warning: Size mismatch. Attempting reshape with -1 for first dimension...")
+            dshape_auto = [-1] + dshape[1:]
+            data = np.reshape(data, tuple(dshape_auto))
+            print(f"Reshaped to: {data.shape}")
+        else:
+            data = np.reshape(data, tuple(dshape))
+        
         if use_gmm:
-            prior = np.reshape(prior,dshape)
+            if prior.size != np.prod(dshape):
+                dshape_prior = [-1] + dshape[1:]
+                prior = np.reshape(prior, tuple(dshape_prior))
+            else:
+                prior = np.reshape(prior, tuple(dshape))
     else: 
-        data = np.reshape(data, (len(data), -1))
+        data = np.reshape(data, (data.shape[0], -1))
         if use_gmm:
-            prior = np.reshape(prior, (len(data), -1))
+            prior = np.reshape(prior, (prior.shape[0], -1))
 
     num_data = data.shape[0]
     print("Data Shape " + str(data.shape))
@@ -205,8 +297,24 @@ if __name__ == '__main__':
         print("Model %s not supported!" % flags.model)
         exit(1)
 
-    os.system('cp CaloDiffu.py {}'.format(checkpoint_folder)) # bkp of model def
-    os.system('cp models.py {}'.format(checkpoint_folder)) # bkp of model def
+    # Enable multi-GPU training if multiple GPUs are available
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_data_parallel = num_gpus > 1
+    if use_data_parallel:
+        print(f"Using {num_gpus} GPUs with DataParallel", flush=True)
+        model = nn.DataParallel(model)
+        # Update device to be the first GPU (DataParallel handles distribution)
+        device = torch.device('cuda:0')
+    else:
+        print(f"Using single GPU/CPU", flush=True)
+    
+    # Helper function to get model state dict (handles DataParallel)
+    def get_model_state_dict(model):
+        if isinstance(model, nn.DataParallel):
+            return model.module.state_dict()
+        return model.state_dict()
+
+    # Backup config file
     os.system('cp {} {}'.format(flags.config,checkpoint_folder)) # bkp of config file
 
     early_stopper = utils.EarlyStopper(patience = dataset_config['EARLYSTOP'], mode = 'diff', min_delta = 1e-5)
@@ -339,7 +447,7 @@ if __name__ == '__main__':
         scheduler.step(torch.tensor([train_loss]))
 
         if(val_loss < min_validation_loss):
-            torch.save(model.state_dict(), os.path.join(checkpoint_folder, 'best_val.pth'))
+            torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'best_val.pth'))
             min_validation_loss = val_loss
 
         if(early_stopper.early_stop(val_loss - train_loss)):
@@ -353,7 +461,7 @@ if __name__ == '__main__':
         #save full training state so can be resumed
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': get_model_state_dict(model),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'train_loss_hist': training_losses,
@@ -369,7 +477,7 @@ if __name__ == '__main__':
             # full state (resume-able)
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': get_model_state_dict(model),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss_hist': training_losses,
@@ -383,7 +491,7 @@ if __name__ == '__main__':
             vfileout.write("\n".join("{}".format(vl) for vl in val_losses)+"\n")
 
     print("Saving to %s" % checkpoint_folder, flush=True)
-    torch.save(model.state_dict(), os.path.join(checkpoint_folder, 'final.pth'))
+    torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'final.pth'))
 
     with open(checkpoint_folder + "/training_losses.txt","w") as tfileout:
         tfileout.write("\n".join("{}".format(tl) for tl in training_losses)+"\n")

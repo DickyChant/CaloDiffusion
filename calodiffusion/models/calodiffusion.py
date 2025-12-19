@@ -1982,19 +1982,35 @@ class CaloDiffu(nn.Module):
         return x_next, xs, x0s
     
     def pred_meanflow(self, x, E, t_emb, r_emb=None, layers=None,):
+        import inspect
 
-
+        # Ensure E has the right shape: (batch_size, 1) or (batch_size, cond_size)
+        if E.ndim == 1:
+            E = E.reshape(-1, 1)
+        
         # layer cond
         if self.layer_cond and layers is not None:
-            E = torch.cat([E.reshape(-1, 1), layers], dim=1)
+            E = torch.cat([E, layers], dim=1)
 
+        # Check if model's forward method accepts 'r' parameter
+        forward_sig = inspect.signature(self.model.forward)
+        accepts_r = 'r' in forward_sig.parameters
 
         # your lowhigh path already expects 2 returns from the model
-        out = self.model(
-            self.add_RZPhi(x),
-            time=t_emb.reshape(-1,),
-            cond=E.reshape(-1,), r=r_emb.reshape(-1,)
-        )
+        # Pass E with shape (batch_size, cond_size), not flattened
+        if accepts_r and r_emb is not None:
+            out = self.model(
+                self.add_RZPhi(x),
+                time=t_emb.reshape(-1,),
+                cond=E, r=r_emb.reshape(-1,)
+            )
+        else:
+            # Standard CondUnet doesn't accept 'r', so don't pass it
+            out = self.model(
+                self.add_RZPhi(x),
+                time=t_emb.reshape(-1,),
+                cond=E
+            )
 
         return out
     def pred(self, x, E, t_emb, r_emb=None, layers=None,
