@@ -42,7 +42,8 @@ if __name__ == '__main__':
     # Determine if GMM mode is enabled
     use_gmm = flags.gmm_prior is not None
     if use_gmm:
-        print(f"Using GMM prior file: {flags.gmm_prior}", flush=True)
+        print(f"Using GMM checkpoint for on-the-fly sampling: {flags.gmm_prior}", flush=True)
+        print(f"[INFO] GMM will sample prior during training (not loading pre-generated H5)", flush=True)
 
     dataset_config = utils.LoadJson(flags.config)
 
@@ -66,7 +67,15 @@ if __name__ == '__main__':
 
     nholdout  = dataset_config.get('HOLDOUT', 0)
 
-    batch_size = dataset_config['BATCH']
+    # Use batch size from config (can be overridden with BATCH_MEANFLOW)
+    # MeanFlow with jvp is very memory-intensive - use smaller batch size
+    # DataParallel doesn't help with jvp since it runs on single GPU
+    default_batch_meanflow = min(32, dataset_config.get('BATCH', 256) // 4)  # Much smaller default
+    batch_size = dataset_config.get('BATCH_MEANFLOW', default_batch_meanflow)
+    print(f"Using batch size {batch_size} for MeanFlow training (jvp is memory-intensive)", flush=True)
+    if batch_size > 64:
+        print(f"[WARNING] Batch size {batch_size} may be too large for jvp. Consider reducing BATCH_MEANFLOW in config.", flush=True)
+    
     num_epochs = dataset_config['MAXEPOCH']
     early_stop = dataset_config['EARLYSTOP']
     training_obj = dataset_config.get('TRAINING_OBJ', 'noise_pred')
@@ -75,6 +84,7 @@ if __name__ == '__main__':
     shower_embed = dataset_config.get('SHOWER_EMBED', '')
     orig_shape = ('orig' in shower_embed)
     energy_loss_scale = dataset_config.get('ENERGY_LOSS_SCALE', 0.0)
+    weight_pidm = dataset_config.get('WEIGHT_PIDM', flags.weight_pidm)
     
     # Check if pre-embedding is needed
     pre_embed = ('pre-embed' in shower_embed) or ('NN' in shower_embed)
@@ -94,25 +104,54 @@ if __name__ == '__main__':
         ).to(device=device)
         NN_embed.init(norm=True, dataset_num=dataset_num)
         print(f"Initialized HGCalConverter for pre-embedding: {geom_file}", flush=True)
+    
+    # Will initialize GMM model after detecting data format
+    gmm_model = None
+    gmm_mean = None
+    gmm_std = None
+    detected_voxel_shape = None  # Will be set after first data load
 
     data = []
     energies = []
     prior = [] if use_gmm else None
+    
+    # Determine expected raw spatial size for GMM prior conversion
+    # IMPORTANT: Use MAX_CELLS from config, not the actual data file size,
+    # because the embedding layer was initialized with MAX_CELLS
+    expected_raw_spatial_size = None
+    if use_gmm:
+        # Use MAX_CELLS from config (this is what the embedding expects)
+        expected_raw_spatial_size = dataset_config.get('MAX_CELLS', None)
+        if expected_raw_spatial_size is None:
+            # Fall back to SHAPE_ORIG if MAX_CELLS not set
+            expected_raw_spatial_size = dataset_config.get('SHAPE_ORIG', [None, None, None])[2]
+        
+        if expected_raw_spatial_size is None:
+            # Last resort: peek at data file
+            first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
+            if os.path.exists(first_data_file):
+                with h5.File(first_data_file, "r") as h5f_data:
+                    raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
+                    if raw_data_sample.ndim >= 3:
+                        expected_raw_spatial_size = raw_data_sample.shape[2]
+                        print(f"[WARNING] MAX_CELLS not in config, detected from data file: {expected_raw_spatial_size}", flush=True)
+        
+        print(f"[INFO] Using MAX_CELLS from config for embedding: {expected_raw_spatial_size}", flush=True)
 
     for i, dataset in enumerate(dataset_config['FILES']):
         # Load data
         data_, gen_info_, layers_ = utils.DataLoader(
-            os.path.join(flags.data_folder,dataset),
-            hgcal=True,  # Use HGCal loader
-            shape=dataset_config['SHAPE_PAD'],
-            emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
-            nevts = flags.nevts,
-            max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
-            logE=dataset_config['logE'],
-            showerMap = dataset_config['SHOWERMAP'],
-            nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
-            dataset_num  = dataset_num,
-            orig_shape = orig_shape,
+                os.path.join(flags.data_folder,dataset),
+                hgcal=True,  # Use HGCal loader
+                shape=dataset_config['SHAPE_PAD'],
+                emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
+                nevts = flags.nevts,
+                max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
+                logE=dataset_config['logE'],
+                showerMap = dataset_config['SHOWERMAP'],
+                nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
+                dataset_num  = dataset_num,
+                orig_shape = orig_shape,
             embed=pre_embed,
             NN_embed=NN_embed,
             config=dataset_config,
@@ -123,37 +162,232 @@ if __name__ == '__main__':
         # Extract energy from gen_info (first column)
         e_ = gen_info_[:, 0] if gen_info_.ndim > 1 else gen_info_
         
-        # Load GMM prior if needed
+        # Sample from GMM prior if needed (instead of loading pre-generated H5)
         if use_gmm:
-            # Load prior from H5 file
-            prior_file = flags.gmm_prior
-            if not os.path.exists(prior_file):
-                raise FileNotFoundError(f"GMM prior file not found: {prior_file}")
+            # Detect voxel shape from first data batch
+            if detected_voxel_shape is None:
+                # Peek at raw data to detect format
+                first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
+                with h5.File(first_data_file, "r") as h5f_data:
+                    raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
+                    if raw_data_sample.ndim == 3:
+                        detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2])  # (layers, spatial_size)
+                    elif raw_data_sample.ndim == 4:
+                        detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2], raw_data_sample.shape[3])  # (layers, H, W)
+                    else:
+                        raise ValueError(f"Unexpected raw data shape: {raw_data_sample.shape}")
+                print(f"[INFO] Detected voxel shape: {detected_voxel_shape}", flush=True)
             
-            with h5.File(prior_file, "r") as h5f:
-                # Load same number of events as data
-                n_events = data_.shape[0]
-                prior_raw = h5f["showers"][:n_events].astype(np.float32) * shower_scale
+            # Initialize GMM model once
+            if gmm_model is None:
+                from calodiffusion.train.gmm_hgcal import OriginalMDNConditionalGMM
+                from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
+                
+                gmm_ckpt_path = flags.gmm_prior  # Checkpoint path
+                if not os.path.exists(gmm_ckpt_path):
+                    raise FileNotFoundError(f"GMM checkpoint not found: {gmm_ckpt_path}")
+                
+                # Check if file is actually a checkpoint (should be .pt file)
+                if not gmm_ckpt_path.endswith('.pt'):
+                    raise ValueError(
+                        f"GMM checkpoint path should be a .pt file, got: {gmm_ckpt_path}\n"
+                        f"Note: You should pass the GMM checkpoint path (e.g., gmm_prior_checkpoint.pt), "
+                        f"not the H5 prior file. The code will sample from the checkpoint on-the-fly."
+                    )
+                
+                print(f"[INFO] Loading GMM checkpoint from: {gmm_ckpt_path}", flush=True)
+                try:
+                    # Load checkpoint (weights_only=False because checkpoint contains model state, mean, std, etc.)
+                    ckpt = torch.load(gmm_ckpt_path, map_location=device, weights_only=False)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to load GMM checkpoint from {gmm_ckpt_path}.\n"
+                        f"Error: {e}\n"
+                        f"The file may be corrupted or not a valid PyTorch checkpoint.\n"
+                        f"Please verify the checkpoint file or retrain the GMM model."
+                    ) from e
+                
+                # Verify checkpoint has required keys
+                required_keys = ['model_state', 'cond_dim', 'data_dim', 'K', 'hidden', 'mean', 'std']
+                missing_keys = [k for k in required_keys if k not in ckpt]
+                if missing_keys:
+                    raise ValueError(
+                        f"GMM checkpoint is missing required keys: {missing_keys}\n"
+                        f"Found keys: {list(ckpt.keys())}\n"
+                        f"The checkpoint may be from an older version. Please retrain the GMM model."
+                    )
+                
+                # Get data_dim from checkpoint (should match what GMM was trained on)
+                data_dim = ckpt.get('data_dim', None)
+                if data_dim is None:
+                    # Calculate from detected shape as fallback
+                    if len(detected_voxel_shape) == 2:
+                        data_dim = detected_voxel_shape[0] * detected_voxel_shape[1]
+                    elif len(detected_voxel_shape) == 3:
+                        data_dim = np.prod(detected_voxel_shape)
+                    else:
+                        raise ValueError(f"Cannot determine data_dim")
+                
+                gmm_model = OriginalMDNConditionalGMM(
+                    cond_dim=ckpt['cond_dim'],
+                    data_dim=data_dim,
+                    K=ckpt['K'],
+                    hidden=ckpt['hidden']
+                ).to(device)
+                gmm_model.load_state_dict(ckpt["model_state"])
+                gmm_model.eval()
+                gmm_mean = ckpt['mean']
+                gmm_std = ckpt['std']
+                print(f"[INFO] Loaded GMM model from checkpoint: {gmm_ckpt_path}", flush=True)
+                print(f"[INFO] GMM: cond_dim={ckpt['cond_dim']}, data_dim={data_dim}, K={ckpt['K']}, hidden={ckpt['hidden']}", flush=True)
+            
+            # Sample from GMM using the same energies as data
+            n_events = data_.shape[0]
+            e_prior = e_[:n_events] if len(e_) >= n_events else e_
+            
+            # Convert energies to log-space for GMM conditioning (same as GMM training)
+            E_min, E_max = 1.0, 1000.0  # Same as in gmm_hgcal.py
+            e_prior_GeV = e_prior / 1000.0  # Convert to GeV if needed
+            cE = (np.log10(np.clip(e_prior_GeV, E_min, E_max)) - np.log10(E_min)) / (np.log10(E_max) - np.log10(E_min))
+            cE = np.clip(cE, 0.0, 1.0).astype(np.float32)
+            cE_tensor = torch.from_numpy(cE).view(-1, 1).to(device)
+            
+            # Sample from GMM in batches
+            batch_size_gmm = 512
+            samples_list = []
+            with torch.no_grad():
+                for j in range(0, len(cE_tensor), batch_size_gmm):
+                    c_chunk = cE_tensor[j:j+batch_size_gmm]
+                    # Sample from GMM (no anchor needed for pure sampling)
+                    s_chunk = gmm_model.sample_pure(
+                        c_chunk,
+                        n_per_cond=1,
+                        x_anchor=None,
+                        lam=0.0,  # No tethering during training
+                        sigma=0.001,
+                    )  # (B, data_dim) on device
+                    samples_list.append(s_chunk.cpu())
+            
+            prior_flat = torch.cat(samples_list, dim=0).numpy()  # (N, data_dim)
+            
+            # Reshape to match detected voxel shape
+            if len(detected_voxel_shape) == 2:
+                prior_raw = prior_flat.reshape(n_events, detected_voxel_shape[0], detected_voxel_shape[1])
+            elif len(detected_voxel_shape) == 3:
+                prior_raw = prior_flat.reshape(n_events, *detected_voxel_shape)
+            else:
+                raise ValueError(f"Cannot reshape prior to detected_voxel_shape: {detected_voxel_shape}")
+            
+            # Convert from standardized logit-space to physical
+            from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
+            prior_raw = invert_to_physical_logit(
+                torch.from_numpy(prior_flat).view(n_events, -1),
+                e_prior_GeV * 1000.0,  # Back to original units
+                gmm_mean,
+                gmm_std,
+                detected_voxel_shape
+            ).numpy()
+            
+            # Apply shower_scale if needed
+            prior_raw = prior_raw * shower_scale
+            
+            print(f"Prior raw shape: {prior_raw.shape}", flush=True)
+            print(f"Data shape after embedding: {data_.shape}", flush=True)
+            
+            # Check if prior is already in embedded format (matches data shape)
+            expected_embedded_shape = data_.shape[1:] if data_.ndim > 1 else None
+            prior_already_embedded = (prior_raw.ndim == len(data_.shape) and 
+                                     prior_raw.shape[1:] == data_.shape[1:])
             
             # Process prior through same pipeline as data
             # Get energies for preprocessing (use same as data)
             e_prior = e_[:n_events] if len(e_) >= n_events else e_
             
-            # Preprocess prior
-            prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
-                prior_raw,
-                e_prior,
-                dataset_config['SHAPE_PAD'],
-                dataset_config['SHOWERMAP'],
-                dataset_num=dataset_num,
-                orig_shape=orig_shape,
-                ecut=dataset_config.get('ECUT', 0),
-                max_deposit=dataset_config['MAXDEP'],
-            )
-            
-            # Apply embedding if needed
-            if pre_embed and NN_embed is not None:
-                prior_preprocessed = NN_embed.enc_batches(torch.Tensor(prior_preprocessed)).cpu().numpy()
+            if prior_already_embedded:
+                # Prior is already in embedded format, just preprocess
+                print("Prior is already in embedded format, skipping embedding", flush=True)
+                prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                    prior_raw,
+                    e_prior,
+                    dataset_config['SHAPE_PAD'],
+                    dataset_config['SHOWERMAP'],
+                    dataset_num=dataset_num,
+                    orig_shape=orig_shape,
+                    ecut=dataset_config.get('ECUT', 0),
+                    max_deposit=dataset_config['MAXDEP'],
+                )
+            elif pre_embed and NN_embed is not None:
+                # Prior needs to go through embedding
+                # Check if prior is in (N, layers, spatial_2d) format - need to flatten to (N, layers, spatial_1d)
+                if prior_raw.ndim == 4 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
+                    # Prior is in (N, 47, H, W) format - flatten spatial dimensions to (N, 47, H*W)
+                    print(f"Reshaping prior from {prior_raw.shape} to raw format for embedding", flush=True)
+                    n_events_prior, n_layers, h, w = prior_raw.shape
+                    prior_raw = prior_raw.reshape(n_events_prior, n_layers, h * w)
+                    print(f"Prior reshaped to: {prior_raw.shape}", flush=True)
+                
+                # Check if prior has compatible shape for embedding (N, 47, spatial_size)
+                if prior_raw.ndim == 3 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
+                    # Use the detected expected spatial size (from actual data or config)
+                    expected_spatial_size = expected_raw_spatial_size
+                    actual_spatial_size = prior_raw.shape[2]
+                    
+                    # Intelligently handle size mismatch using actual input data size
+                    if actual_spatial_size != expected_spatial_size:
+                        print(f"[INFO] Prior spatial size mismatch: {actual_spatial_size} vs expected {expected_spatial_size}", flush=True)
+                        print(f"[INFO] Intelligently converting prior to match actual data format...", flush=True)
+                        
+                        # Smart conversion: pad with zeros if smaller, crop if larger
+                        # This preserves the existing data and pads/crops appropriately
+                        if actual_spatial_size < expected_spatial_size:
+                            # Pad with zeros at the end (low-energy cells typically at the end)
+                            pad_size = expected_spatial_size - actual_spatial_size
+                            prior_raw = np.pad(prior_raw, ((0, 0), (0, 0), (0, pad_size)), 
+                                             mode='constant', constant_values=0)
+                            print(f"[INFO] Padded prior from {actual_spatial_size} to {expected_spatial_size} cells (added {pad_size} zero cells)", flush=True)
+                        else:
+                            # Crop to expected size (keep the first cells, which are typically higher energy)
+                            prior_raw = prior_raw[:, :, :expected_spatial_size]
+                            print(f"[INFO] Cropped prior from {actual_spatial_size} to {expected_spatial_size} cells (removed {actual_spatial_size - expected_spatial_size} cells)", flush=True)
+                        
+                        print(f"[NOTE] For best results, regenerate GMM prior with spatial size matching your data ({expected_spatial_size} cells)", flush=True)
+                    
+                    # Prior now has correct shape, apply embedding
+                    print(f"Applying embedding to prior: {prior_raw.shape} -> embedded", flush=True)
+                    # Convert numpy array to torch tensor and apply embedding
+                    # enc_batches already returns numpy array (does .cpu().numpy() internally)
+                    prior_embedded = NN_embed.enc_batches(torch.Tensor(prior_raw))
+                    # Preprocess after embedding
+                    prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                        prior_embedded,
+                        e_prior,
+                        dataset_config['SHAPE_PAD'],
+                        dataset_config['SHOWERMAP'],
+                        dataset_num=dataset_num,
+                        orig_shape=orig_shape,
+                        ecut=dataset_config.get('ECUT', 0),
+                        max_deposit=dataset_config['MAXDEP'],
+                    )
+                else:
+                    # Prior shape doesn't match - might be from different geometry
+                    raise ValueError(
+                        f"Prior shape {prior_raw.shape} is incompatible. "
+                        f"Expected either embedded shape {expected_embedded_shape} or "
+                        f"raw shape (N, {dataset_config['SHAPE_ORIG'][1]}, {dataset_config.get('MAX_CELLS', 'spatial_size')}). "
+                        f"Prior may be from a different geometry configuration."
+                    )
+            else:
+                # No embedding, preprocess directly
+                prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                    prior_raw,
+                    e_prior,
+                    dataset_config['SHAPE_PAD'],
+                    dataset_config['SHOWERMAP'],
+                    dataset_num=dataset_num,
+                    orig_shape=orig_shape,
+                    ecut=dataset_config.get('ECUT', 0),
+                    max_deposit=dataset_config['MAXDEP'],
+                )
             
             prior_ = prior_preprocessed.astype(np.float32)
 
@@ -171,7 +405,7 @@ if __name__ == '__main__':
     avg_showers = std_showers = E_bins = None
     # NN_embed already initialized above if pre_embed is True
 
-    energies = np.reshape(energies,(-1))
+    energies = np.reshape(energies,(-1))    
     
     # Check current data shape
     print(f"Data shape before reshape: {data.shape}")
@@ -298,15 +532,26 @@ if __name__ == '__main__':
         exit(1)
 
     # Enable multi-GPU training if multiple GPUs are available
+    # DISABLE DataParallel for MeanFlow: jvp (used in loss computation) doesn't work with DataParallel
+    # See: https://github.com/pytorch/pytorch/issues/102197
+    # However, we use manual multi-GPU splitting in _parallel_jvp to utilize multiple GPUs
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_data_parallel = num_gpus > 1
-    if use_data_parallel:
-        print(f"Using {num_gpus} GPUs with DataParallel", flush=True)
-        model = nn.DataParallel(model)
-        # Update device to be the first GPU (DataParallel handles distribution)
-        device = torch.device('cuda:0')
+    if num_gpus > 1:
+        print(f"[INFO] {num_gpus} GPUs detected for MeanFlow training", flush=True)
+        print(f"[INFO] DataParallel DISABLED (jvp incompatible), but using manual multi-GPU batch splitting", flush=True)
+        print(f"[INFO] Batches will be split across {num_gpus} GPUs during jvp computation", flush=True)
+        print(f"[INFO] Model will run on primary GPU: {device}", flush=True)
     else:
-        print(f"Using single GPU/CPU", flush=True)
+        print(f"[INFO] Using single GPU/CPU: {device}", flush=True)
+    
+    # Don't wrap model in DataParallel - jvp doesn't work with it
+    # But _parallel_jvp will manually split batches across GPUs
+    
+    # Helper function to get the actual model (handles DataParallel)
+    def get_model(model):
+        if isinstance(model, nn.DataParallel):
+            return model.module
+        return model
     
     # Helper function to get model state dict (handles DataParallel)
     def get_model_state_dict(model):
@@ -370,13 +615,28 @@ if __name__ == '__main__':
 
             noise = torch.randn_like(data)
 
+            # Get the actual model (handles DataParallel)
+            actual_model = get_model(model)
+            loss_pidm_vec = None
             if use_gmm:
-                loss_vec, loss_ref = model.compute_loss_meanflow_gmm(data, E, gmm_prior=prior, noise = noise, energy_loss_scale = energy_loss_scale)
+                # For GMM, check if there's a PIDM version
+                if hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(data, E, gmm_prior=prior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                else:
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(data, E, gmm_prior=prior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    batch_loss = loss_vec.mean()
             else:
-                loss_vec, loss_ref = model.compute_loss_meanflow(data, E, noise = noise, energy_loss_scale = energy_loss_scale)
+                # Use PIDM version which includes physics constraints
+                loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(data, E, noise = noise, energy_loss_scale = energy_loss_scale)
+                batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
             
-            batch_loss = loss_vec.mean()
             batch_loss_ref = loss_ref.mean()
+            
+            # Save loss value before deleting tensors
+            batch_loss_value = batch_loss.item()
+            batch_loss_ref_value = batch_loss_ref.item()
+            loss_pidm_value = loss_pidm_vec.mean().item() if loss_pidm_vec is not None else None
             
             batch_loss.backward()
 
@@ -384,18 +644,35 @@ if __name__ == '__main__':
             grad_norm = clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
 
             optimizer.step()
-            train_loss += batch_loss.item()
+            
+            # Clear cache aggressively after each step (jvp is very memory-intensive)
+            # Delete intermediate tensors to free memory
+            del batch_loss, loss_vec, loss_ref, noise
+            if loss_pidm_vec is not None:
+                del loss_pidm_vec
+            if use_gmm:
+                del prior
+            del data, E
+            
+            # Clear cache every step (not just every 10) - jvp needs aggressive cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # Synchronize to ensure memory is freed before next iteration
+                torch.cuda.synchronize()
+            train_loss += batch_loss_value
 
             # progress bar
-            train_pbar.set_postfix(
-                loss=f"{batch_loss.item():.4f}",
-                ref_loss=f"{batch_loss_ref.item():.4f}",
-            )
-
-            if use_gmm:
-                del data, E, prior, noise, batch_loss, batch_loss_ref
+            if loss_pidm_value is not None:
+                train_pbar.set_postfix(
+                    loss=f"{batch_loss_value:.4f}",
+                    ref_loss=f"{batch_loss_ref_value:.4f}",
+                    pidm_loss=f"{loss_pidm_value:.4f}",
+                )
             else:
-                del data, E, noise, batch_loss, batch_loss_ref
+                train_pbar.set_postfix(
+                    loss=f"{batch_loss_value:.4f}",
+                    ref_loss=f"{batch_loss_ref_value:.4f}",
+                )
 
         train_loss = train_loss/len(loader_train)
         training_losses[epoch] = train_loss
@@ -418,21 +695,34 @@ if __name__ == '__main__':
                 vE = vE.to(device = device)
 
             noise = torch.randn_like(vdata)
-            if(cold_diffu): noise = model.gen_cold_image(vE, cold_noise_scale, noise)
+            # Get the actual model (handles DataParallel)
+            actual_model = get_model(model)
+            if(cold_diffu): noise = actual_model.gen_cold_image(vE, cold_noise_scale, noise)
 
             if use_gmm:
-                loss_vec, loss_ref = model.compute_loss_meanflow_gmm(vdata, vE, gmm_prior=vprior, noise = noise, energy_loss_scale = energy_loss_scale)
+                # For GMM, check if there's a PIDM version
+                if hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(vdata, vE, gmm_prior=vprior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                else:
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(vdata, vE, gmm_prior=vprior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    batch_loss = loss_vec.mean()
             else:
-                loss_vec, loss_ref = model.compute_loss_meanflow(vdata, vE, noise = noise, energy_loss_scale = energy_loss_scale)
+                # Use PIDM version which includes physics constraints
+                loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(vdata, vE, noise = noise, energy_loss_scale = energy_loss_scale)
+                batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
             
-            batch_loss = loss_vec.mean()
             batch_loss_ref = loss_ref.mean()
 
-            val_loss+=batch_loss.item()
+            # Save loss values before deleting tensors
+            batch_loss_value = batch_loss.item()
+            batch_loss_ref_value = batch_loss_ref.item()
+            
+            val_loss += batch_loss_value
             
             val_pbar.set_postfix(
-                loss=f"{batch_loss.item():.4f}",
-                ref_loss=f"{batch_loss_ref.item():.4f}",
+                loss=f"{batch_loss_value:.4f}",
+                ref_loss=f"{batch_loss_ref_value:.4f}",
             )
             
             if use_gmm:

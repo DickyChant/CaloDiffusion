@@ -13,6 +13,7 @@ from calodiffusion.utils.utils import LoadJson
 
 from calodiffusion.train.train_diffusion import TrainDiffusion
 from calodiffusion.train.train_layer_model import TrainLayerModel
+from calodiffusion.train.train_meanflow import TrainMeanFlow
 
 
 class dotdict(dict):
@@ -100,6 +101,27 @@ def diffusion(ctx):
     non_config = dotdict({key: value for key, value in ctx.obj.items() if key!='config'})
     ctx.obj.config['flags'] = non_config
     run_inference(ctx.obj, ctx.obj.config, model=TrainDiffusion)
+
+@sample.command()
+@click.option("--gmm-prior", default=None, help="Path to GMM prior H5 file (for MeanFlow with GMM)")
+@click.pass_context
+def meanflow(ctx, gmm_prior):
+    """Sample from MeanFlow diffusion model (with optional GMM prior)."""
+    non_config = dotdict({key: value for key, value in ctx.obj.items() if key!='config'})
+    ctx.obj.config['flags'] = non_config
+    if gmm_prior is not None:
+        ctx.obj.gmm_prior = gmm_prior
+        ctx.obj.config['gmm_prior'] = gmm_prior
+        # Use meanflow_gmm sampler if GMM prior is provided
+        if ctx.obj.sample_algo == "DDim":  # Only override if default
+            ctx.obj.sample_algo = "meanflow_gmm"
+            ctx.obj.config['SAMPLER'] = "meanflow_gmm"
+    else:
+        # Use meanflow sampler if no GMM prior
+        if ctx.obj.sample_algo == "DDim":  # Only override if default
+            ctx.obj.sample_algo = "meanflow"
+            ctx.obj.config['SAMPLER'] = "meanflow"
+    run_inference(ctx.obj, ctx.obj.config, model=TrainMeanFlow)
 
 @inference.command()
 @click.option("-g", "--generated", default="", help="Path to existing generated results")

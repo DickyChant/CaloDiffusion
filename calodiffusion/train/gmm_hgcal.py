@@ -184,8 +184,7 @@ def logit(x, alpha = 1e-6):
 
 def preprocess_showers_and_energies_logit(
     data, true_energies, eps=1e-8,
-    #voxel_shape=(28,40,40),
-    voxel_shape=(47,40,40),
+    voxel_shape=None,  # Will be auto-detected from data if None
     energy_scale_div=1000.0,
     #energy_log_base_range=(50.0, 100.0)
     energy_log_base_range=(1.0, 1000.0)
@@ -196,14 +195,54 @@ def preprocess_showers_and_energies_logit(
     X = np.asarray(data, dtype=np.float64) / energy_scale_div
     E = np.asarray(true_energies, dtype=np.float64).reshape(-1) / energy_scale_div  # (N,)
 
-    # Ensure voxel shape
-    if X.ndim == 2 and X.shape[1] == np.prod(voxel_shape):
-        X = X.reshape(-1, *voxel_shape)  # (N,30,30,30)
-    elif not (X.ndim == 4 and X.shape[1:] == voxel_shape):
-        raise ValueError(f"Unexpected data shape {X.shape}; expected (N,30,30,30) or flat D={np.prod(voxel_shape)}.")
+    # Auto-detect voxel_shape from data if not provided
+    if voxel_shape is None:
+        if X.ndim == 4:
+            voxel_shape = X.shape[1:]  # (layers, H, W)
+        elif X.ndim == 3:
+            voxel_shape = X.shape[1:]  # (layers, spatial_size)
+        else:
+            raise ValueError(f"Cannot auto-detect voxel_shape from data shape: {X.shape}")
+
+    # Handle different data formats
+    if X.ndim == 2:
+        # Flattened data - reshape using voxel_shape
+        expected_size = np.prod(voxel_shape)
+        if X.shape[1] == expected_size:
+            if len(voxel_shape) == 3:
+                X = X.reshape(-1, *voxel_shape)  # (N, layers, H, W)
+            elif len(voxel_shape) == 2:
+                X = X.reshape(-1, *voxel_shape)  # (N, layers, spatial_size)
+            else:
+                raise ValueError(f"Unexpected voxel_shape: {voxel_shape}")
+        else:
+            raise ValueError(f"Flattened data size {X.shape[1]} doesn't match voxel_shape {voxel_shape} (expected {expected_size})")
+    elif X.ndim == 3:
+        # 3D format: (N, layers, spatial_size) - check if matches voxel_shape
+        if len(voxel_shape) == 2 and X.shape[1:] == voxel_shape:
+            pass  # Already correct shape
+        else:
+            raise ValueError(f"3D data shape {X.shape[1:]} doesn't match voxel_shape {voxel_shape}")
+    elif X.ndim == 4:
+        # 4D format: (N, layers, H, W) - check if matches voxel_shape
+        if len(voxel_shape) == 3 and X.shape[1:] == voxel_shape:
+            pass  # Already correct shape
+        else:
+            raise ValueError(f"4D data shape {X.shape[1:]} doesn't match voxel_shape {voxel_shape}")
+    else:
+        raise ValueError(f"Unexpected data shape {X.shape}; expected 2D, 3D, or 4D")
 
     # --- FIX: broadcast energy over voxels ---
-    denom = 5.0 * E.reshape(-1, 1, 1, 1)   # (N,1,1,1)
+    # Handle different dimensionalities
+    if X.ndim == 4:
+        # 4D: (N, layers, H, W)
+        denom = 5.0 * E.reshape(-1, 1, 1, 1)   # (N,1,1,1)
+    elif X.ndim == 3:
+        # 3D: (N, layers, spatial_size)
+        denom = 5.0 * E.reshape(-1, 1, 1)   # (N,1,1)
+    else:
+        raise ValueError(f"Unexpected X.ndim: {X.ndim}")
+    
     scaled = X / (denom + eps)             # per-event scaling
 
     # Log + standardize
@@ -601,8 +640,16 @@ def invert_to_physical_logit(
         v_frac = reverse_logit_torch(z, alpha=alpha)
         v_frac = torch.clamp(v_frac, 0.0, 1.0)
 
-        out = v_frac * (5.0 * E.view(-1, 1, 1, 1))
-        return out  # torch.Tensor (N,45,50,18)
+        # Handle different voxel_shape formats
+        if len(voxel_shape) == 3:
+            # 3D: (layers, H, W)
+            out = v_frac * (5.0 * E.view(-1, 1, 1, 1))
+        elif len(voxel_shape) == 2:
+            # 2D: (layers, spatial_size)
+            out = v_frac * (5.0 * E.view(-1, 1, 1))
+        else:
+            raise ValueError(f"Unexpected voxel_shape format: {voxel_shape}")
+        return out
 
     else:
         # --- NumPy path ---
@@ -619,7 +666,15 @@ def invert_to_physical_logit(
         v_frac = reverse_logit_np(z, alpha=alpha)
         np.clip(v_frac, 0.0, 1.0, out=v_frac)
 
-        out = v_frac * (5.0 * E.reshape(-1, 1, 1, 1))
+        # Handle different voxel_shape formats
+        if len(voxel_shape) == 3:
+            # 3D: (layers, H, W)
+            out = v_frac * (5.0 * E.reshape(-1, 1, 1, 1))
+        elif len(voxel_shape) == 2:
+            # 2D: (layers, spatial_size)
+            out = v_frac * (5.0 * E.reshape(-1, 1, 1))
+        else:
+            raise ValueError(f"Unexpected voxel_shape format: {voxel_shape}")
         return out.astype(np.float32)
 
     
@@ -644,17 +699,39 @@ def export_physical_real_and_prior_logit(
 ):
     """
     Produces and saves:
-      - {out_prefix}_real.h5  with dataset 'showers'  (N,45,50,18) physical
-      - {out_prefix}_prior.h5 with dataset 'showers'  (Ns,45,50,18) physical
+      - {out_prefix}_real.h5  with dataset 'showers'  physical format matching input
+      - {out_prefix}_prior.h5 with dataset 'showers'  physical format matching input
     Returns (real_phys, prior_phys) as torch tensors.
     """
     assert mean is not None and std is not None, "Provide mean/std used in preprocessing."
     assert energies_val_GeV is not None, "Provide per-event real energies (GeV)."
 
-    # ensure shapes/tensors
+    # Detect voxel_shape from input if not provided
     Xv = X_val_std.to(torch.float32)
+    if voxel_shape is None:
+        # Auto-detect from X_val_std shape
+        if Xv.ndim == 4:
+            voxel_shape = (Xv.shape[1], Xv.shape[2], Xv.shape[3])
+            print(f"[INFO] Auto-detected voxel_shape from input: {voxel_shape} (layers, H, W)", flush=True)
+        elif Xv.ndim == 3:
+            voxel_shape = (Xv.shape[1], Xv.shape[2])  # (layers, spatial_size)
+            print(f"[INFO] Auto-detected voxel_shape from input: {voxel_shape} (layers, spatial_size)", flush=True)
+        else:
+            raise ValueError(f"Cannot auto-detect voxel_shape from X_val_std shape: {Xv.shape}")
+    
+    # Ensure Xv has correct shape
     if Xv.ndim == 2:
-        Xv = Xv.view(Xv.shape[0], *voxel_shape)
+        # Flattened input - reshape using voxel_shape
+        if len(voxel_shape) == 3:
+            Xv = Xv.view(Xv.shape[0], *voxel_shape)
+        elif len(voxel_shape) == 2:
+            Xv = Xv.view(Xv.shape[0], *voxel_shape)
+    elif Xv.ndim == 3 and len(voxel_shape) == 3:
+        # Input is (N, layers, spatial_size) but voxel_shape is (layers, H, W)
+        # Try to reshape spatial_size to H*W
+        if Xv.shape[2] == np.prod(voxel_shape[1:]):
+            Xv = Xv.view(Xv.shape[0], voxel_shape[0], voxel_shape[1], voxel_shape[2])
+    
     c  = cond_val
 
     # your existing energy transform (unchanged)
@@ -678,7 +755,15 @@ def export_physical_real_and_prior_logit(
 
 
 
-    prior_std = prior_flat.view(-1, *voxel_shape).to(Xv.device)
+    # Reshape prior_flat to match voxel_shape
+    if len(voxel_shape) == 3:
+        # 3D voxel_shape: (layers, H, W)
+        prior_std = prior_flat.view(-1, *voxel_shape).to(Xv.device)
+    elif len(voxel_shape) == 2:
+        # 2D voxel_shape: (layers, spatial_size) - keep as is
+        prior_std = prior_flat.view(-1, *voxel_shape).to(Xv.device)
+    else:
+        raise ValueError(f"Unexpected voxel_shape format: {voxel_shape}")
 
     # reverse normalization to physical (both real & prior)
     real_phys  = invert_to_physical_logit(Xv,        E_real,  mean, std, voxel_shape)   # (N,45,50,18)
@@ -742,10 +827,13 @@ def export_physical_real_and_prior_logit(
     if save:
         prior_path = os.path.join(data_folder, f"{out_prefix}_prior_hgcal2024.h5")
         os.makedirs(os.path.dirname(prior_path) if os.path.dirname(prior_path) else '.', exist_ok=True)
+        
+        # Save in the format specified
+        prior_to_save = prior_phys.cpu().numpy()
         with h5.File(prior_path, "w") as f:
-            f.create_dataset("showers", data=prior_phys.cpu().numpy(), compression="gzip")
+            f.create_dataset("showers", data=prior_to_save, compression="gzip")
 
-        print(f"[saved]  prior → {prior_path}")
+        print(f"[saved]  prior → {prior_path} (shape: {prior_to_save.shape})")
     return real_phys, prior_phys
 
 
@@ -958,6 +1046,8 @@ if __name__ == "__main__":
     parser.add_argument('--tether_lam', type=float, default=0.4, help='Tether lambda parameter')
     parser.add_argument('--tether_sigma', type=float, default=0.001, help='Tether sigma parameter')
     parser.add_argument('--sweep_runs', type=int, default=10, help='Number of runs for sweep_prior_stats')
+    parser.add_argument('--save_raw_format', action='store_true', help='Save prior in raw format (N, 47, spatial_size) instead of (N, 47, 40, 40)')
+    parser.add_argument('--raw_spatial_size', type=int, default=None, help='Raw spatial size for saving (e.g., 2076). Required if --save_raw_format is used.')
     flags = parser.parse_args()
 
     #dataset_config = {'SHAPE': (-1,28,40,40,1)}
@@ -1017,8 +1107,40 @@ if __name__ == "__main__":
     # Determine nevts per file if specified
     nevts_per_file = flags.nevts_per_file if flags.nevts_per_file is not None else flags.nevts
     
+    # First, peek at raw data to detect original format BEFORE reshaping
+    print("Detecting original data format...")
+    original_spatial_size = None
+    original_shape = None
+    with h5.File(h5_paths[0], "r") as h5f:
+        raw_sample = h5f[flags.dataset_key][:1]
+        original_shape = raw_sample.shape
+        if raw_sample.ndim == 3:
+            # Raw format: (N, layers, spatial_size)
+            original_spatial_size = raw_sample.shape[2]
+            n_layers = raw_sample.shape[1]
+            print(f"[INFO] Original raw data format: (N, {n_layers}, {original_spatial_size})", flush=True)
+        elif raw_sample.ndim == 4:
+            # Already in (N, layers, H, W) format
+            n_layers, h, w = raw_sample.shape[1], raw_sample.shape[2], raw_sample.shape[3]
+            original_spatial_size = h * w
+            print(f"[INFO] Original data format: (N, {n_layers}, {h}, {w}) = (N, {n_layers}, {original_spatial_size})", flush=True)
+        else:
+            print(f"[WARNING] Unexpected raw data shape: {raw_sample.shape}", flush=True)
+    
     # Load data from all files
+    # For GMM, ALWAYS preserve the original format from H5 file (don't reshape)
+    # This ensures the prior is saved in the same format as the raw data
     print("Loading data from files...")
+    if original_shape is not None and len(original_shape) == 3:
+        # Original is (N, layers, spatial_size) - preserve this format!
+        print(f"[INFO] Preserving original format: loading WITHOUT reshaping to keep (N, {original_shape[1]}, {original_shape[2]})", flush=True)
+        print(f"[INFO] This ensures GMM prior will be saved in the same format as your raw data", flush=True)
+        load_with_reshape = False
+    else:
+        # Original is already 4D or different format - use normal loading
+        print(f"[INFO] Original format is {original_shape}, using normal loading", flush=True)
+        load_with_reshape = auto_reshape
+    
     showers, energies = load_showers_from_h5(
         h5_paths, 
         nevts=flags.nevts,  # Total events across all files (or -1 for all)
@@ -1028,7 +1150,7 @@ if __name__ == "__main__":
         gen_info_key=flags.gen_info_key,
         gen_info_energy_col=flags.gen_info_energy_col,
         target_spatial_shape=target_spatial,
-        auto_reshape=auto_reshape
+        auto_reshape=load_with_reshape  # Disable reshaping to preserve original format
     )
     
     print(f"\n{'='*60}")
@@ -1039,7 +1161,28 @@ if __name__ == "__main__":
     print(f"  Energy range: {energies.min():.2f} - {energies.max():.2f} GeV")
     print(f"  Total events: {showers.shape[0]:,}")
     print(f"{'='*60}\n")
-    X, energies_data, (mu, sd) = preprocess_showers_and_energies_logit(showers, energies)
+    
+    # Detect actual spatial dimensions from loaded data (instead of hardcoding)
+    # This will be used to save the prior in the same format as input
+    if showers.ndim == 4:
+        # Data is in (N, layers, H, W) format
+        detected_voxel_shape = (showers.shape[1], showers.shape[2], showers.shape[3])
+        print(f"[INFO] Detected voxel shape from loaded data: {detected_voxel_shape} (layers, H, W)", flush=True)
+    elif showers.ndim == 3:
+        # Data is in (N, layers, spatial_size) format - preserve this!
+        n_layers = showers.shape[1]
+        spatial_size = showers.shape[2]
+        # Keep as 1D spatial format (N, layers, spatial_size) - don't reshape to 2D
+        detected_voxel_shape = (n_layers, spatial_size)  # 2-tuple for (layers, spatial_size)
+        print(f"[INFO] Detected 1D spatial format: (N, {n_layers}, {spatial_size}) - will save prior in this format", flush=True)
+    else:
+        raise ValueError(f"Unexpected data shape: {showers.shape}")
+    
+    # Pass detected_voxel_shape to preprocessing function
+    X, energies_data, (mu, sd) = preprocess_showers_and_energies_logit(
+        showers, energies, 
+        voxel_shape=detected_voxel_shape  # Use detected shape instead of hardcoded
+    )
     
     
     
@@ -1103,7 +1246,13 @@ if __name__ == "__main__":
             mdn.load_state_dict(ckpt["model_state"])
             mdn.eval()
             
-            X_3d = Xall.reshape(-1,47,40,40).contiguous()
+            # Reshape Xall to match detected shape
+            if len(detected_voxel_shape) == 3:
+                X_3d = Xall.reshape(-1, *detected_voxel_shape).contiguous()
+            elif len(detected_voxel_shape) == 2:
+                X_3d = Xall.reshape(-1, *detected_voxel_shape).contiguous()
+            else:
+                raise ValueError(f"Unexpected detected_voxel_shape: {detected_voxel_shape}")
 
             real_phys_t, prior_phys_t = export_physical_real_and_prior_logit(
                 X_val_std=X_3d,
@@ -1113,7 +1262,7 @@ if __name__ == "__main__":
                 mean=mu, std=sd,
                 tether_lam=flags.tether_lam, tether_sigma=flags.tether_sigma,
                 energies_val_GeV=E_all_GeV,
-                voxel_shape=(47,40,40),
+                voxel_shape=detected_voxel_shape,  # Use detected shape
                 out_prefix=flags.out_prefix,
                 n_per_cond=1,
                 save=False,
@@ -1129,7 +1278,7 @@ if __name__ == "__main__":
                 E_all_GeV=E_all_GeV,    # same energies as used in export
                 mean=mu,
                 std=sd,
-                voxel_shape=(47,40,40),
+                voxel_shape=detected_voxel_shape,  # Use detected shape
                 tether_lam=flags.tether_lam, tether_sigma=flags.tether_sigma,
                 out_prefix=flags.out_prefix,
                 num_runs=flags.sweep_runs,
@@ -1165,7 +1314,20 @@ if __name__ == "__main__":
         }, ckpt_path)
         print(f"[saved] GMM checkpoint → {ckpt_path}")
 
-        X_3d = Xall.reshape(-1,47,40,40).contiguous()
+        # Use detected voxel shape instead of hardcoded (47,40,40)
+        # Reshape Xall to match detected shape
+        if len(detected_voxel_shape) == 2:
+            # 2-tuple: (layers, spatial_size) - 1D spatial format
+            X_3d = Xall.reshape(-1, detected_voxel_shape[0], detected_voxel_shape[1]).contiguous()
+            voxel_shape_for_export = detected_voxel_shape  # (layers, spatial_size)
+        elif len(detected_voxel_shape) == 3:
+            # 3-tuple: (layers, H, W) - 2D spatial format
+            X_3d = Xall.reshape(-1, *detected_voxel_shape).contiguous()
+            voxel_shape_for_export = detected_voxel_shape  # (layers, H, W)
+        else:
+            raise ValueError(f"Unexpected detected_voxel_shape: {detected_voxel_shape}")
+        
+        print(f"[INFO] Using detected voxel shape for export: {voxel_shape_for_export}", flush=True)
 
         real_phys_t, prior_phys_t = export_physical_real_and_prior_logit(
             X_val_std=X_3d,
@@ -1175,7 +1337,7 @@ if __name__ == "__main__":
             mean=mu, std=sd,
             tether_lam=flags.tether_lam, tether_sigma=flags.tether_sigma,
             energies_val_GeV=E_all_GeV,
-            voxel_shape=(47,40,40),
+            voxel_shape=voxel_shape_for_export,
             out_prefix=flags.out_prefix,
             n_per_cond=1,
             data_folder=flags.data_folder,

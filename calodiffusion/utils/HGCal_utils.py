@@ -263,15 +263,40 @@ def ReverseNormHGCal(
         data[data < 0] = 0
 
         # Renormalize layer energies
-        prev_layers = np.sum(data, (2), keepdims=True)
-        layers = layers.reshape((-1, data.shape[1], 1))
+        # Sum over spatial dimensions (H and W) - data shape is (B, L, H, W)
+        # For HGCal, data might be (B, L, H, W) or (B, L, spatial_size)
+        if data.ndim == 4:
+            # 4D: (B, L, H, W) - sum over H and W
+            prev_layers = np.sum(data, (2, 3), keepdims=True)  # (B, L, 1, 1)
+            layers = layers.reshape((-1, data.shape[1], 1, 1))  # (B, L, 1, 1)
+        elif data.ndim == 3:
+            # 3D: (B, L, spatial_size) - sum over spatial dimension
+            prev_layers = np.sum(data, (2), keepdims=True)  # (B, L, 1)
+            layers = layers.reshape((-1, data.shape[1], 1))  # (B, L, 1)
+        else:
+            # Fallback: assume 2D or reshape
+            prev_layers = np.sum(data, axis=-1, keepdims=True)
+            layers = layers.reshape((-1, data.shape[1], 1))
+        
         rescale_facs = layers / (prev_layers + 1e-10)
         # If layer is essential zero from base network or layer network, don't rescale
         rescale_facs[layers < eps] = 1.0
         rescale_facs[prev_layers < eps] = 1.0
         data *= rescale_facs
 
-    data = data * max_deposit * energy.reshape(-1, 1, 1)
+    # Reshape energy to match data dimensions for broadcasting
+    # data can be (B, L, H, W) or (B, L, spatial_size)
+    if data.ndim == 4:
+        # 4D: (B, L, H, W) - need (B, 1, 1, 1)
+        energy_reshaped = energy.reshape(-1, 1, 1, 1)
+    elif data.ndim == 3:
+        # 3D: (B, L, spatial_size) - need (B, 1, 1)
+        energy_reshaped = energy.reshape(-1, 1, 1)
+    else:
+        # Fallback: assume 2D or 1D
+        energy_reshaped = energy.reshape(-1, 1)
+    
+    data = data * max_deposit * energy_reshaped
 
     if ecut > 0 and False:
         print("Applying ECut " + str(ecut))

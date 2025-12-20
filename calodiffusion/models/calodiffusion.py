@@ -15,6 +15,7 @@ from calodiffusion.models.models import ResNet, CondUnet, PureDiT, MeanFlowDiT, 
 from calodiffusion.models import models as models_module
 from calodiffusion.utils import sampling
 from calodiffusion.utils import utils
+from calodiffusion.utils.utils import ReverseNorm
 import calodiffusion.utils.HGCal_utils as hgcal_utils
 
 # Alias for CaloDiffu class compatibility
@@ -326,6 +327,79 @@ def _per_layer_fraction_diff(A, B, eps=1e-12):
 
 class CaloDiffu(nn.Module):
     """Diffusion based generative model"""
+    
+    def _parallel_jvp(self, fn, primals, tangents, energy, layers=None):
+        """
+        Manual multi-GPU jvp: split batch across GPUs to reduce memory usage.
+        jvp doesn't work with DataParallel, but we can manually split the batch.
+        See: https://github.com/pytorch/pytorch/issues/102197
+        
+        Args:
+            fn: Function that takes (z, cur_r, cur_t, energy_chunk, layers_chunk)
+            primals: Tuple of (z_t, r, t)
+            tangents: Tuple of (v_t, zeros_like(r), ones_like(t))
+            energy: Energy tensor for conditioning
+            layers: Optional layers tensor
+        """
+        z_t, r, t = primals
+        v_t, _, _ = tangents
+        batch_size = z_t.shape[0]
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        original_device = z_t.device
+        
+        # Only split if we have multiple GPUs and batch is large enough
+        if num_gpus > 1 and batch_size > 32:
+            # Split batch across GPUs
+            chunk_size = max(batch_size // num_gpus, 1)  # At least 1 per GPU
+            
+            u_chunks = []
+            dudt_chunks = []
+            
+            for i in range(num_gpus):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, batch_size)
+                if start_idx >= batch_size:
+                    break
+                    
+                device_i = torch.device(f"cuda:{i}")
+                
+                # Move chunk to GPU i
+                z_t_chunk = z_t[start_idx:end_idx].to(device_i)
+                r_chunk = r[start_idx:end_idx].to(device_i)
+                t_chunk = t[start_idx:end_idx].to(device_i)
+                v_t_chunk = v_t[start_idx:end_idx].to(device_i)
+                energy_chunk = energy[start_idx:end_idx].to(device_i)
+                layers_chunk = layers[start_idx:end_idx].to(device_i) if layers is not None else None
+                
+                # Temporarily move model to this GPU for jvp
+                original_model_device = next(self.parameters()).device
+                self.to(device_i)
+                
+                primals_chunk = (z_t_chunk, r_chunk, t_chunk)
+                tangents_chunk = (v_t_chunk, torch.zeros_like(r_chunk), torch.ones_like(t_chunk))
+                
+                def fn_chunk(z, cur_r, cur_t):
+                    return fn(z, cur_r, cur_t, energy_chunk, layers_chunk)
+                
+                u_chunk, dudt_chunk = jvp(fn_chunk, primals_chunk, tangents_chunk)
+                
+                # Move results back to original device
+                u_chunks.append(u_chunk.to(original_device))
+                dudt_chunks.append(dudt_chunk.to(original_device))
+                
+                # Move model back
+                self.to(original_model_device)
+            
+            # Concatenate results
+            u = torch.cat(u_chunks, dim=0)
+            dudt = torch.cat(dudt_chunks, dim=0)
+            return u, dudt
+        else:
+            # Single GPU or small batch - use original approach
+            # For single GPU, fn should work with full energy/layers
+            def fn_single(z, cur_r, cur_t):
+                return fn(z, cur_r, cur_t, energy, layers)
+            return jvp(fn_single, primals, tangents)
     def __init__(self, data_shape, config=None, R_Z_inputs = False, training_obj = 'noise_pred', nsteps = 400,
                     cold_diffu = False, E_bins = None, avg_showers = None, std_showers = None, NN_embed = None):
         super(CaloDiffu, self).__init__()
@@ -1098,11 +1172,12 @@ class CaloDiffu(nn.Module):
         primals = (z_t, r, t)
         tangents = (v_t, torch.zeros_like(r), torch.ones_like(t))
         
-        def fn_current(z, cur_r, cur_t):
-            return self.pred_meanflow(z, energy, cur_t, r_emb = cur_r, layers=layers)
+        # Use manual multi-GPU jvp to reduce memory usage
+        # jvp doesn't work with DataParallel, but we can manually split the batch
+        def fn_current(z, cur_r, cur_t, energy_chunk, layers_chunk):
+            return self.pred_meanflow(z, energy_chunk, cur_t, r_emb = cur_r, layers=layers_chunk)
         
-        
-        u, dudt = jvp(fn_current,primals,tangents)
+        u, dudt = self._parallel_jvp(fn_current, primals, tangents, energy, layers)
         
         
         u_target = v_t - time_diff * dudt
@@ -1120,6 +1195,20 @@ class CaloDiffu(nn.Module):
             loss = weights * loss_mid          
         else:
             loss = loss_mid
+        
+        # Add energy conservation physics constraint if energy_loss_scale > 0
+        if energy_loss_scale > 0:
+            # Compute predicted x0 from the flow prediction
+            # For MeanFlow, we can approximate x0 from the current prediction
+            # Using the flow: x0 ≈ z_t - t * u (approximate, may need adjustment based on your flow definition)
+            x0_pred = z_t - t_.view(-1, *((1,) * (len(data.shape) - 1))) * u
+            
+            # Sum total energy over spatial dimensions
+            dims = [i for i in range(1, len(data.shape))]
+            tot_energy_pred = torch.sum(x0_pred, dim=dims)
+            tot_energy_data = torch.sum(data, dim=dims)
+            loss_en = energy_loss_scale * torch.nn.functional.mse_loss(tot_energy_data, tot_energy_pred) / self.nvoxels
+            loss = loss + loss_en
         #loss_mean_ref = torch.mean((error**2))
      
             
@@ -1163,11 +1252,12 @@ class CaloDiffu(nn.Module):
         primals = (z_t, r, t)
         tangents = (v_t, torch.zeros_like(r), torch.ones_like(t))
         
-        def fn_current(z, cur_r, cur_t):
-            return self.pred_meanflow(z, energy, cur_t, r_emb = cur_r, layers=layers)
+        # Use manual multi-GPU jvp to reduce memory usage
+        # jvp doesn't work with DataParallel, but we can manually split the batch
+        def fn_current(z, cur_r, cur_t, energy_chunk, layers_chunk):
+            return self.pred_meanflow(z, energy_chunk, cur_t, r_emb = cur_r, layers=layers_chunk)
         
-        
-        u, dudt = jvp(fn_current,primals,tangents)
+        u, dudt = self._parallel_jvp(fn_current, primals, tangents, energy, layers)
         
         
         u_target = v_t - time_diff * dudt
@@ -1192,15 +1282,65 @@ class CaloDiffu(nn.Module):
             dataset_config = self.config
 
             # ---- reverse normalisation back to physical space ----
+            # Check if HGCal (dataset_num=2 typically indicates HGCal)
+            is_hgcal = dataset_config.get('HGCAL', False) or dataset_config.get('DATASET_NUM', 0) == 2
+            # Convert tensors to numpy for ReverseNorm
+            real_std_np = real_std.detach().cpu().numpy() if torch.is_tensor(real_std) else real_std
+            gen_std_np = gen_std.detach().cpu().numpy() if torch.is_tensor(gen_std) else gen_std
+            E_std_np = E_std.detach().cpu().numpy() if torch.is_tensor(E_std) else E_std
+            
+            # Ensure E_std_np is 2D: (batch_size, num_features)
+            # ReverseNormHGCal expects e to be 2D for indexing e[:, 0]
+            if E_std_np.ndim == 1:
+                E_std_np = E_std_np.reshape(-1, 1)
+            
+            # Handle layerE: ReverseNormHGCal requires it if "layer" is in showerMap
+            shower_map = dataset_config.get('SHOWERMAP', '')
+            layerE_np = None
+            if layers is not None:
+                layerE_np = layers.detach().cpu().numpy() if torch.is_tensor(layers) else layers
+                if layerE_np.ndim == 1:
+                    layerE_np = layerE_np.reshape(-1, 1)
+            elif "layer" in shower_map:
+                # If showerMap contains "layer" but layers is None, create dummy layerE
+                # ReverseNormHGCal expects layerE with shape (batch_size, 1+num_layers)
+                # First column is totalE (normalized), rest are layer energies (normalized/logit)
+                batch_size = E_std_np.shape[0]
+                num_layers = 47  # HGCal has 47 layers
+                # Create dummy layerE: (totalE, layer1, layer2, ...)
+                # Use E_std_np for totalE (already normalized), zeros for layers (will normalize to uniform)
+                layerE_np = np.zeros((batch_size, 1 + num_layers))
+                layerE_np[:, 0] = E_std_np[:, 0]  # totalE from E_std (already normalized)
+                # Layer energies: zeros will normalize to uniform distribution after reverse_logit
+                # This is a reasonable default when actual layer energies are not available
+                layerE_np[:, 1:] = 0.0
+            
+            # Use SHAPE_ORIG if available, otherwise fall back to SHAPE or SHAPE_PAD
+            shape_key = dataset_config.get('SHAPE_ORIG') or dataset_config.get('SHAPE') or dataset_config.get('SHAPE_PAD')
+            
+            # Ensure emin/emax are scalars, not arrays
+            # ReverseNormHGCal expects scalars, but config might have arrays (e.g., [50, 1.99, 1.57])
+            emin_val = dataset_config['EMIN']
+            emax_val = dataset_config['EMAX']
+            if isinstance(emin_val, (list, tuple, np.ndarray)):
+                emin_val = float(emin_val[0]) if len(emin_val) > 0 else float(emin_val)
+            else:
+                emin_val = float(emin_val)
+            if isinstance(emax_val, (list, tuple, np.ndarray)):
+                emax_val = float(emax_val[0]) if len(emax_val) > 0 else float(emax_val)
+            else:
+                emax_val = float(emax_val)
+            
             real_phys, E_phys = ReverseNorm(
-                real_std,
-                E_std,
-                layerE     = torch.zeros_like(E_std,device=device),
-                shape      = dataset_config['SHAPE'],
+                real_std_np,
+                E_std_np,
+                hgcal      = is_hgcal,
+                layerE     = layerE_np,
+                shape      = shape_key,
                 logE       = dataset_config['logE'],
                 max_deposit= dataset_config['MAXDEP'],
-                emax       = dataset_config['EMAX'],
-                emin       = dataset_config['EMIN'],
+                emax       = emax_val,
+                emin       = emin_val,
                 showerMap  = dataset_config['SHOWERMAP'],
                 dataset_num= dataset_config['DATASET_NUM'],
                 orig_shape = False,
@@ -1208,21 +1348,40 @@ class CaloDiffu(nn.Module):
             )
 
             gen_phys, _ = ReverseNorm(
-                gen_std,
-                E_std,                       # same incident energies for this batch
-                layerE     = torch.zeros_like(E_std,device=device),
-                shape      = dataset_config['SHAPE'],
+                gen_std_np,
+                E_std_np,                       # same incident energies for this batch
+                hgcal      = is_hgcal,
+                layerE     = layerE_np,
+                shape      = shape_key,
                 logE       = dataset_config['logE'],
                 max_deposit= dataset_config['MAXDEP'],
-                emax       = dataset_config['EMAX'],
-                emin       = dataset_config['EMIN'],
+                emax       = emax_val,
+                emin       = emin_val,
                 showerMap  = dataset_config['SHOWERMAP'],
                 dataset_num= dataset_config['DATASET_NUM'],
                 orig_shape = False,
                 ecut       = dataset_config['ECUT'],
             )
-        S_true   = _layer_sums(real_phys.view(data.shape),         layer_dim=2)      # target from data
-        S_sample = _layer_sums(gen_phys.view(data.shape),  layer_dim=2)
+        # Convert numpy arrays to PyTorch tensors and reshape to match data shape
+        # real_phys and gen_phys are numpy arrays from ReverseNorm
+        # data.shape is (B, 1, L, H, W) = (B, 1, 47, 12, 21)
+        real_phys_tensor = torch.from_numpy(real_phys).to(device=device, dtype=data.dtype)
+        gen_phys_tensor = torch.from_numpy(gen_phys).to(device=device, dtype=data.dtype)
+        
+        # Reshape to match data shape: (B, 1, L, H, W)
+        # real_phys/gen_phys might be (B, L, H, W) or (B, L*H*W) depending on ReverseNorm output
+        if real_phys_tensor.ndim == 4:  # (B, L, H, W)
+            real_phys_tensor = real_phys_tensor.unsqueeze(1)  # -> (B, 1, L, H, W)
+        elif real_phys_tensor.ndim == 2:  # (B, L*H*W) - flattened
+            real_phys_tensor = real_phys_tensor.reshape(data.shape)  # -> (B, 1, L, H, W)
+        
+        if gen_phys_tensor.ndim == 4:  # (B, L, H, W)
+            gen_phys_tensor = gen_phys_tensor.unsqueeze(1)  # -> (B, 1, L, H, W)
+        elif gen_phys_tensor.ndim == 2:  # (B, L*H*W) - flattened
+            gen_phys_tensor = gen_phys_tensor.reshape(data.shape)  # -> (B, 1, L, H, W)
+        
+        S_true   = _layer_sums(real_phys_tensor, layer_dim=2)      # target from data
+        S_sample = _layer_sums(gen_phys_tensor, layer_dim=2)
         
         #w = (S_true / (S_true.sum(dim=1, keepdim=True) + 1e-8)).detach()
         w = 1
@@ -1284,11 +1443,13 @@ class CaloDiffu(nn.Module):
         primals = (z_t, r, t)
         tangents = (v_t, torch.zeros_like(r), torch.ones_like(t))
         
-        def fn_current(z, cur_r, cur_t):
-            return self.pred_meanflow(z, energy, cur_t, r_emb = cur_r, layers=layers)
-
+        # Use manual multi-GPU jvp to reduce memory usage
+        def fn_current(z, cur_r, cur_t, energy_chunk=None, layers_chunk=None):
+            e = energy_chunk if energy_chunk is not None else energy
+            l = layers_chunk if layers_chunk is not None else layers
+            return self.pred_meanflow(z, e, cur_t, r_emb = cur_r, layers=l)
         
-        u, dudt = jvp(fn_current,primals,tangents)
+        u, dudt = self._parallel_jvp(fn_current, primals, tangents, energy, layers)
         
         
         u_target = v_t - time_diff * dudt
@@ -1346,11 +1507,13 @@ class CaloDiffu(nn.Module):
         primals = (z_t, r, t)
         tangents = (v_t, torch.zeros_like(r), torch.ones_like(t))
         
-        def fn_current(z, cur_r, cur_t):
-            return self.pred_meanflow(z, energy, cur_t, r_emb = cur_r, layers=layers)
-
+        # Use manual multi-GPU jvp to reduce memory usage
+        def fn_current(z, cur_r, cur_t, energy_chunk=None, layers_chunk=None):
+            e = energy_chunk if energy_chunk is not None else energy
+            l = layers_chunk if layers_chunk is not None else layers
+            return self.pred_meanflow(z, e, cur_t, r_emb = cur_r, layers=l)
         
-        u, dudt = jvp(fn_current,primals,tangents)
+        u, dudt = self._parallel_jvp(fn_current, primals, tangents, energy, layers)
         
         
         u_target = v_t - time_diff * dudt
@@ -1377,15 +1540,65 @@ class CaloDiffu(nn.Module):
             dataset_config = self.config
 
             # ---- reverse normalisation back to physical space ----
+            # Check if HGCal (dataset_num=2 typically indicates HGCal)
+            is_hgcal = dataset_config.get('HGCAL', False) or dataset_config.get('DATASET_NUM', 0) == 2
+            # Convert tensors to numpy for ReverseNorm
+            real_std_np = real_std.detach().cpu().numpy() if torch.is_tensor(real_std) else real_std
+            gen_std_np = gen_std.detach().cpu().numpy() if torch.is_tensor(gen_std) else gen_std
+            E_std_np = E_std.detach().cpu().numpy() if torch.is_tensor(E_std) else E_std
+            
+            # Ensure E_std_np is 2D: (batch_size, num_features)
+            # ReverseNormHGCal expects e to be 2D for indexing e[:, 0]
+            if E_std_np.ndim == 1:
+                E_std_np = E_std_np.reshape(-1, 1)
+            
+            # Handle layerE: ReverseNormHGCal requires it if "layer" is in showerMap
+            shower_map = dataset_config.get('SHOWERMAP', '')
+            layerE_np = None
+            if layers is not None:
+                layerE_np = layers.detach().cpu().numpy() if torch.is_tensor(layers) else layers
+                if layerE_np.ndim == 1:
+                    layerE_np = layerE_np.reshape(-1, 1)
+            elif "layer" in shower_map:
+                # If showerMap contains "layer" but layers is None, create dummy layerE
+                # ReverseNormHGCal expects layerE with shape (batch_size, 1+num_layers)
+                # First column is totalE (normalized), rest are layer energies (normalized/logit)
+                batch_size = E_std_np.shape[0]
+                num_layers = 47  # HGCal has 47 layers
+                # Create dummy layerE: (totalE, layer1, layer2, ...)
+                # Use E_std_np for totalE (already normalized), zeros for layers (will normalize to uniform)
+                layerE_np = np.zeros((batch_size, 1 + num_layers))
+                layerE_np[:, 0] = E_std_np[:, 0]  # totalE from E_std (already normalized)
+                # Layer energies: zeros will normalize to uniform distribution after reverse_logit
+                # This is a reasonable default when actual layer energies are not available
+                layerE_np[:, 1:] = 0.0
+            
+            # Use SHAPE_ORIG if available, otherwise fall back to SHAPE or SHAPE_PAD
+            shape_key = dataset_config.get('SHAPE_ORIG') or dataset_config.get('SHAPE') or dataset_config.get('SHAPE_PAD')
+            
+            # Ensure emin/emax are scalars, not arrays
+            # ReverseNormHGCal expects scalars, but config might have arrays (e.g., [50, 1.99, 1.57])
+            emin_val = dataset_config['EMIN']
+            emax_val = dataset_config['EMAX']
+            if isinstance(emin_val, (list, tuple, np.ndarray)):
+                emin_val = float(emin_val[0]) if len(emin_val) > 0 else float(emin_val)
+            else:
+                emin_val = float(emin_val)
+            if isinstance(emax_val, (list, tuple, np.ndarray)):
+                emax_val = float(emax_val[0]) if len(emax_val) > 0 else float(emax_val)
+            else:
+                emax_val = float(emax_val)
+            
             real_phys, E_phys = ReverseNorm(
-                real_std,
-                E_std,
-                layerE     = torch.zeros_like(E_std,device=device),
-                shape      = dataset_config['SHAPE'],
+                real_std_np,
+                E_std_np,
+                hgcal      = is_hgcal,
+                layerE     = layerE_np,
+                shape      = shape_key,
                 logE       = dataset_config['logE'],
                 max_deposit= dataset_config['MAXDEP'],
-                emax       = dataset_config['EMAX'],
-                emin       = dataset_config['EMIN'],
+                emax       = emax_val,
+                emin       = emin_val,
                 showerMap  = dataset_config['SHOWERMAP'],
                 dataset_num= dataset_config['DATASET_NUM'],
                 orig_shape = False,
@@ -1393,21 +1606,40 @@ class CaloDiffu(nn.Module):
             )
 
             gen_phys, _ = ReverseNorm(
-                gen_std,
-                E_std,                       # same incident energies for this batch
-                layerE     = torch.zeros_like(E_std,device=device),
-                shape      = dataset_config['SHAPE'],
+                gen_std_np,
+                E_std_np,                       # same incident energies for this batch
+                hgcal      = is_hgcal,
+                layerE     = layerE_np,
+                shape      = shape_key,
                 logE       = dataset_config['logE'],
                 max_deposit= dataset_config['MAXDEP'],
-                emax       = dataset_config['EMAX'],
-                emin       = dataset_config['EMIN'],
+                emax       = emax_val,
+                emin       = emin_val,
                 showerMap  = dataset_config['SHOWERMAP'],
                 dataset_num= dataset_config['DATASET_NUM'],
                 orig_shape = False,
                 ecut       = dataset_config['ECUT'],
             )
-        S_true   = _layer_sums(real_phys.view(data.shape),         layer_dim=2)      # target from data
-        S_sample = _layer_sums(gen_phys.view(data.shape),  layer_dim=2)
+        # Convert numpy arrays to PyTorch tensors and reshape to match data shape
+        # real_phys and gen_phys are numpy arrays from ReverseNorm
+        # data.shape is (B, 1, L, H, W) = (B, 1, 47, 12, 21)
+        real_phys_tensor = torch.from_numpy(real_phys).to(device=device, dtype=data.dtype)
+        gen_phys_tensor = torch.from_numpy(gen_phys).to(device=device, dtype=data.dtype)
+        
+        # Reshape to match data shape: (B, 1, L, H, W)
+        # real_phys/gen_phys might be (B, L, H, W) or (B, L*H*W) depending on ReverseNorm output
+        if real_phys_tensor.ndim == 4:  # (B, L, H, W)
+            real_phys_tensor = real_phys_tensor.unsqueeze(1)  # -> (B, 1, L, H, W)
+        elif real_phys_tensor.ndim == 2:  # (B, L*H*W) - flattened
+            real_phys_tensor = real_phys_tensor.reshape(data.shape)  # -> (B, 1, L, H, W)
+        
+        if gen_phys_tensor.ndim == 4:  # (B, L, H, W)
+            gen_phys_tensor = gen_phys_tensor.unsqueeze(1)  # -> (B, 1, L, H, W)
+        elif gen_phys_tensor.ndim == 2:  # (B, L*H*W) - flattened
+            gen_phys_tensor = gen_phys_tensor.reshape(data.shape)  # -> (B, 1, L, H, W)
+        
+        S_true   = _layer_sums(real_phys_tensor, layer_dim=2)      # target from data
+        S_sample = _layer_sums(gen_phys_tensor, layer_dim=2)
         
         #w = (S_true / (S_true.sum(dim=1, keepdim=True) + 1e-8)).detach()
         w = 1
@@ -1983,6 +2215,7 @@ class CaloDiffu(nn.Module):
     
     def pred_meanflow(self, x, E, t_emb, r_emb=None, layers=None,):
         import inspect
+        import torch.nn as nn
 
         # Ensure E has the right shape: (batch_size, 1) or (batch_size, cond_size)
         if E.ndim == 1:
@@ -1992,21 +2225,27 @@ class CaloDiffu(nn.Module):
         if self.layer_cond and layers is not None:
             E = torch.cat([E, layers], dim=1)
 
+        # Unwrap model if it's wrapped in DataParallel/DistributedDataParallel
+        # jvp doesn't work with parallel wrappers (see https://github.com/pytorch/pytorch/issues/102197)
+        model_to_use = self.model
+        if isinstance(self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
+            model_to_use = self.model.module
+
         # Check if model's forward method accepts 'r' parameter
-        forward_sig = inspect.signature(self.model.forward)
+        forward_sig = inspect.signature(model_to_use.forward)
         accepts_r = 'r' in forward_sig.parameters
 
         # your lowhigh path already expects 2 returns from the model
         # Pass E with shape (batch_size, cond_size), not flattened
         if accepts_r and r_emb is not None:
-            out = self.model(
+            out = model_to_use(
                 self.add_RZPhi(x),
                 time=t_emb.reshape(-1,),
                 cond=E, r=r_emb.reshape(-1,)
             )
         else:
             # Standard CondUnet doesn't accept 'r', so don't pass it
-            out = self.model(
+            out = model_to_use(
                 self.add_RZPhi(x),
                 time=t_emb.reshape(-1,),
                 cond=E

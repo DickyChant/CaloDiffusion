@@ -50,7 +50,7 @@ class dotdict(dict):
 )
 @click.option("--hgcal/--no-hgcal", default=None, is_flag=True, help="Use HGCal settings (overwrites config)")
 @click.option("--model-loc", default=None, help="Specify existing model to load")
-@click.option("--gmm-prior", default=None, help="Path to GMM prior H5 file (for MeanFlow with GMM)")
+@click.option("--gmm-prior", default=None, help="Path to GMM checkpoint (.pt file) for sampling prior on-the-fly (for MeanFlow with GMM)")
 @click.pass_context
 def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal, gmm_prior): 
     ctx.ensure_object(dotdict)
