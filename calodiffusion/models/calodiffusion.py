@@ -422,7 +422,8 @@ class CaloDiffu(nn.Module):
             ('MFAttn_v1' in self.shower_embed) or
             ('MFUnet' in self.shower_embed) or
             ('MFUnet_v2' in self.shower_embed) or
-            ('MFDiC' in self.shower_embed)
+            ('MFDiC' in self.shower_embed) or
+            ('MF' in self.shower_embed)  # Allow any MF prefix for MeanFlow training
         )
         self.NN_embed = NN_embed
         self.restart_info = self.config.get('restart_info', '')
@@ -606,6 +607,22 @@ class CaloDiffu(nn.Module):
                     time_embed=(self.time_embed == 'sin')
                 )
                 print(self.model)
+            # If MeanFlow is enabled but no specific backbone matched, use regular CondUnet
+            # This allows MeanFlow training with CondUnet backbone (e.g., SHOWER_EMBED="MF-condunet")
+            if not hasattr(self, 'model') or self.model is None:
+                self.model = models.CondUnet(
+                    cond_dim=cond_dim, 
+                    out_dim=1, 
+                    channels=in_channels, 
+                    layer_sizes=layer_sizes, 
+                    block_attn=block_attn, 
+                    mid_attn=mid_attn,
+                    cylindrical=config.get('CYLINDRICAL', False), 
+                    compress_Z=compress_Z, 
+                    data_shape=calo_summary_shape,
+                    cond_embed = (self.E_embed == 'sin'), #cond_size = cond_size,
+                    time_embed=(self.time_embed == 'sin')
+                )
         else:
             self.model = models.CondUnet(
                 cond_dim=cond_dim, 
