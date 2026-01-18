@@ -101,7 +101,10 @@ class Train(ABC):
             # Auto-detect GPUs if not specified explicitly (and > 1)
             if gpus_per_node == 1 and torch.cuda.is_available():
                 available_gpus = torch.cuda.device_count()
-                if available_gpus > 1 and not hasattr(flags, 'gpus_per_node'):
+                # Only auto-detect if user didn't explicitly set gpus_per_node
+                # Check if it's the default value by seeing if enable_ddp is set
+                # If enable_ddp is set but gpus_per_node is 1, user wants single GPU DDP
+                if available_gpus > 1 and not getattr(flags, 'enable_ddp', False):
                     gpus_per_node = available_gpus
             
             self.world_size = n_nodes * gpus_per_node
@@ -172,8 +175,8 @@ class Train(ABC):
             
             # If there's a mismatch, adjust the state dict
             if checkpoint_has_module and not model_has_module:
-                # Remove 'module.' prefix from checkpoint
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+                # Remove 'module.' prefix from checkpoint (only if it starts with it)
+                state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
             elif not checkpoint_has_module and model_has_module:
                 # Add 'module.' prefix to checkpoint
                 state_dict = {f'module.{k}': v for k, v in state_dict.items()}

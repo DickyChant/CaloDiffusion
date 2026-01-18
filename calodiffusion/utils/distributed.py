@@ -25,7 +25,9 @@ def setup_distributed(backend, master_addr, master_port, rank, world_size):
         rank=rank
     )
     
-    print(f"Initialized DDP: rank {rank}/{world_size}, backend={backend}")
+    # Only print from rank 0 to avoid duplicate output
+    if rank == 0:
+        print(f"Initialized DDP: rank {rank}/{world_size}, backend={backend}")
 
 
 def cleanup_distributed():
@@ -136,11 +138,15 @@ def get_distributed_info_from_slurm():
     # Get the first node from the node list
     nodelist = os.environ.get('SLURM_NODELIST', 'localhost')
     # Simple parsing for single node or node range
-    if '[' in nodelist:
-        # Format like "node[001-002]" -> "node001"
-        master_node = nodelist.split('[')[0] + nodelist.split('[')[1].split('-')[0].split(',')[0]
+    # Handle formats like: node001, node001,node002, node[001-002], etc.
+    import re
+    # Match the first node name (before comma or bracket)
+    match = re.match(r'^([^,\[]+)', nodelist)
+    if match:
+        master_node = match.group(1)
     else:
-        master_node = nodelist.split(',')[0]
+        # Fallback to simple split
+        master_node = nodelist.split(',')[0].split('[')[0]
     info['master_addr'] = master_node
     
     # Master port (default or from env)
