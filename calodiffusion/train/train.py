@@ -162,7 +162,23 @@ class Train(ABC):
             checkpoint = torch.load(self.flags.model_loc, map_location=self.device, weights_only=False)
 
         if "model_state_dict" in checkpoint.keys():
-            model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = checkpoint["model_state_dict"]
+            
+            # Handle loading checkpoints with or without DDP module prefix
+            # Check if the checkpoint has 'module.' prefix
+            checkpoint_has_module = any(k.startswith('module.') for k in state_dict.keys())
+            # Check if current model has 'module.' (is wrapped in DDP)
+            model_has_module = hasattr(model, 'module')
+            
+            # If there's a mismatch, adjust the state dict
+            if checkpoint_has_module and not model_has_module:
+                # Remove 'module.' prefix from checkpoint
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            elif not checkpoint_has_module and model_has_module:
+                # Add 'module.' prefix to checkpoint
+                state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+            
+            model.load_state_dict(state_dict)
         elif len(checkpoint.keys()) > 1:
             model.load_state_dict(checkpoint)
 
