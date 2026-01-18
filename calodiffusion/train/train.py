@@ -5,16 +5,38 @@ import os
 import torch
 
 from calodiffusion.utils import utils
+from calodiffusion.utils import distributed as dist_utils
 
 tqdm = utils.import_tqdm()
 
 class Train(ABC): 
     def __init__(self, flags, config, load_data:bool=True, save_model: bool = True) -> None:
-        self.device = utils.get_device()
+        # Initialize distributed training if requested
+        self.use_ddp = self._should_use_ddp(flags)
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        
+        if self.use_ddp:
+            self._setup_distributed(flags)
+        
+        # Set device based on distributed setup
+        if self.use_ddp:
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(self.local_rank)
+        else:
+            self.device = utils.get_device()
+        
         self.save_model = save_model
 
         if load_data: 
-            self.loader_train, self.loader_val = utils.load_data(flags, config)
+            self.loader_train, self.loader_val, self.sampler_train, self.sampler_val = utils.load_data(
+                flags, config, distributed=self.use_ddp
+            )
+        else:
+            # Initialize samplers as None if not loading data
+            self.sampler_train = None
+            self.sampler_val = None
         
         self.config = config
         self.flags = flags
@@ -39,6 +61,67 @@ class Train(ABC):
 
         with open(os.path.join(self.checkpoint_folder, "config.json"), "w") as config_file:
             json.dump(flags.config, config_file) 
+    
+    def _should_use_ddp(self, flags):
+        """Determine if DDP should be enabled based on flags and environment."""
+        # Check SLURM environment first
+        slurm_info = dist_utils.get_distributed_info_from_slurm()
+        if slurm_info is not None and slurm_info['world_size'] > 1:
+            return True
+        
+        # Explicit DDP flag
+        if hasattr(flags, 'enable_ddp') and flags.enable_ddp:
+            return True
+        
+        # Multi-GPU or multi-node configuration
+        if hasattr(flags, 'n_nodes') and hasattr(flags, 'gpus_per_node'):
+            if flags.n_nodes > 1 or flags.gpus_per_node > 1:
+                return True
+        
+        return False
+    
+    def _setup_distributed(self, flags):
+        """Initialize distributed training."""
+        # First check if running in SLURM environment
+        slurm_info = dist_utils.get_distributed_info_from_slurm()
+        
+        if slurm_info is not None:
+            # Use SLURM environment variables
+            self.rank = slurm_info['global_rank']
+            self.world_size = slurm_info['world_size']
+            self.local_rank = slurm_info['local_rank']
+            master_addr = slurm_info['master_addr']
+            master_port = slurm_info['master_port']
+            backend = getattr(flags, 'backend', 'nccl')
+        else:
+            # Use command-line arguments or defaults
+            n_nodes = getattr(flags, 'n_nodes', 1)
+            gpus_per_node = getattr(flags, 'gpus_per_node', 1)
+            
+            # Auto-detect GPUs if not specified explicitly (and > 1)
+            if gpus_per_node == 1 and torch.cuda.is_available():
+                available_gpus = torch.cuda.device_count()
+                if available_gpus > 1 and not hasattr(flags, 'gpus_per_node'):
+                    gpus_per_node = available_gpus
+            
+            self.world_size = n_nodes * gpus_per_node
+            
+            # Get rank from environment (set by torchrun or similar)
+            self.rank = int(os.environ.get('RANK', 0))
+            self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            
+            master_addr = getattr(flags, 'master_addr', 'localhost')
+            master_port = getattr(flags, 'master_port', '29500')
+            backend = getattr(flags, 'backend', 'nccl')
+        
+        # Initialize the process group
+        dist_utils.setup_distributed(
+            backend=backend,
+            master_addr=master_addr,
+            master_port=master_port,
+            rank=self.rank,
+            world_size=self.world_size
+        ) 
 
     @abstractmethod
     def init_model(self): 
@@ -112,6 +195,10 @@ class Train(ABC):
         scheduler,
         early_stopper,
     ):
+        # Only save from the main process (rank 0)
+        if not dist_utils.is_main_process(self.rank):
+            return
+        
         if self.save_model: 
             final_path = os.path.join(self.checkpoint_folder, f"{name}.pth")
             torch.save(
@@ -172,8 +259,14 @@ class Train(ABC):
             val_losses
         )
         # Also save at the end of training
+        # Get the underlying model state dict (unwrap DDP if needed)
+        if self.use_ddp:
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
+        
         self.save(
-            model.state_dict(),
+            model_state,
             epoch=epoch,
             name="final",
             training_losses=training_losses,
@@ -182,3 +275,7 @@ class Train(ABC):
             scheduler=scheduler,
             early_stopper=early_stopper,
         )
+        
+        # Cleanup distributed training
+        if self.use_ddp:
+            dist_utils.cleanup_distributed()
