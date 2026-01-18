@@ -3,4 +3,7 @@
 *.txt
 *.pyc
 slurm/diffu*
-
+*.egg-info/
+__pycache__/
+build/
+dist/

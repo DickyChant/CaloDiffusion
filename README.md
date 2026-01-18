@@ -39,6 +39,77 @@ MODEL-TYPE
 * Example configs in ```[config_dataset1.json/config_dataset2.json/config_dataset3.json]```
 * Additional options can be seen with `calodif-train --help`
 
+## Distributed Data Parallel (DDP) Training
+
+CaloDiffusion supports multi-GPU and multi-node distributed training using PyTorch's DistributedDataParallel (DDP).
+
+### Single-Node Multi-GPU Training
+
+For training on a single node with multiple GPUs, use `torchrun`:
+
+```bash
+torchrun --nproc_per_node=4 -m calodiffusion.training \
+    -c configs/config.json \
+    -d /path/to/data/ \
+    --checkpoint /path/to/models/ \
+    diffusion
+```
+
+This will automatically distribute training across 4 GPUs on the current node.
+
+### Multi-Node Training via SLURM
+
+For multi-node training on HPC clusters with SLURM:
+
+```bash
+python calodiffusion/slurm/submit_training.py \
+    --model diffu \
+    -c config.json \
+    -n my_job_name \
+    --n-nodes 2 \
+    --gpus-per-node 4 \
+    --checkpoint /path/to/models/
+```
+
+This will create and submit a SLURM job for 2 nodes with 4 GPUs each (8 GPUs total).
+
+### DDP Debugging (Single GPU)
+
+To test DDP code on a single GPU (useful for debugging):
+
+```bash
+python -m calodiffusion.training \
+    -c configs/config.json \
+    -d /path/to/data/ \
+    --checkpoint /path/to/models/ \
+    --enable-ddp \
+    diffusion
+```
+
+### DDP Command-Line Options
+
+- `--enable-ddp`: Enable DDP even on single GPU (for debugging)
+- `--n-nodes`: Number of nodes for distributed training (default: 1)
+- `--gpus-per-node`: Number of GPUs per node (default: 1)
+- `--master-addr`: Master node address (default: "localhost")
+- `--master-port`: Master node port (default: "29500")
+- `--backend`: Distributed backend - "nccl" or "gloo" (default: "nccl")
+
+### DDP Behavior
+
+- **Single GPU, no `--enable-ddp`**: Normal single-GPU training (backward compatible)
+- **Single GPU + `--enable-ddp`**: DDP enabled for debugging
+- **`--gpus-per-node > 1` or `--n-nodes > 1`**: DDP automatically enabled
+- **SLURM environment detected**: Auto-configured from SLURM environment variables
+
+### Important Notes
+
+1. **Effective batch size** = `batch_size` × `world_size` (total number of processes)
+2. Checkpoints are saved only from rank 0 (main process)
+3. The underlying model state (without `module.` prefix) is always saved
+4. Checkpoints can be loaded in both DDP and non-DDP modes
+5. For optimal performance, use `backend="nccl"` for GPU training
+
 # Sampling with the learned model
 
 ```bash
