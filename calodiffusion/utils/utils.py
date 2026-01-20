@@ -1059,3 +1059,255 @@ def load_attr(type_: Literal["sampler", "loss"], algo_name: str):
         raise ValueError("%s '%s' is not supported: %s" % (type_, algo_name, e))
     
     return algo
+
+
+# ============================================================================
+# Multi-GPU / Distributed Data Parallel (DDP) Utilities
+# ============================================================================
+
+def setup_ddp(rank=None, world_size=None, backend='nccl'):
+    """
+    Initialize the distributed environment for DDP training.
+    
+    This function can be called in two ways:
+    1. With rank and world_size provided (for manual setup)
+    2. Without arguments (uses environment variables from torchrun/torch.distributed.launch)
+    
+    Args:
+        rank: Process rank (0-indexed). If None, reads from LOCAL_RANK env var.
+        world_size: Total number of processes. If None, reads from WORLD_SIZE env var.
+        backend: Backend to use ('nccl' for GPU, 'gloo' for CPU).
+    
+    Returns:
+        tuple: (rank, world_size, device) for the current process.
+    """
+    import torch.distributed as dist
+    
+    # Check if already initialized
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size(), torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+    
+    # Get rank and world_size from environment if not provided
+    if rank is None:
+        rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', 0)))
+    if world_size is None:
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+    
+    # Only initialize if world_size > 1 (multi-GPU)
+    if world_size > 1:
+        # Set the device for this process
+        if torch.cuda.is_available():
+            local_rank = rank % torch.cuda.device_count()
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+            backend = 'gloo'  # Use gloo for CPU
+        
+        # Initialize process group
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        
+        print(f"[DDP] Initialized process {rank}/{world_size} on device {device}", flush=True)
+    else:
+        # Single GPU mode
+        device = get_device()
+        print(f"[DDP] Single process mode on device {device}", flush=True)
+    
+    return rank, world_size, device
+
+
+def cleanup_ddp():
+    """Clean up the distributed environment."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank=None):
+    """Check if this is the main process (rank 0)."""
+    import torch.distributed as dist
+    if rank is not None:
+        return rank == 0
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True  # Single process mode
+
+
+def get_world_size():
+    """Get the world size (number of processes)."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def get_rank():
+    """Get the rank of the current process."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def get_ddp_device():
+    """Get the device for the current DDP process."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        local_rank = dist.get_rank() % torch.cuda.device_count()
+        return torch.device(f"cuda:{local_rank}")
+    return get_device()
+
+
+def wrap_model_ddp(model, device=None, find_unused_parameters=False):
+    """
+    Wrap a model with DistributedDataParallel if in distributed mode.
+    
+    Args:
+        model: The PyTorch model to wrap.
+        device: Device to move the model to.
+        find_unused_parameters: Set to True if some parameters might not be used.
+        
+    Returns:
+        The wrapped model (or original if not in distributed mode).
+    """
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    
+    if device is not None:
+        model = model.to(device)
+    
+    if dist.is_initialized() and get_world_size() > 1:
+        local_rank = get_rank() % torch.cuda.device_count()
+        model = DDP(
+            model, 
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=find_unused_parameters
+        )
+        print(f"[DDP] Model wrapped with DDP on device cuda:{local_rank}", flush=True)
+    
+    return model
+
+
+def get_model_state_dict(model):
+    """Get the state dict from a model, handling DDP wrapper."""
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    if isinstance(model, DDP):
+        return model.module.state_dict()
+    return model.state_dict()
+
+
+def get_unwrapped_model(model):
+    """Get the underlying model from a DDP wrapper."""
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    if isinstance(model, DDP):
+        return model.module
+    return model
+
+
+def load_data_ddp(args, config, eval=False, NN_embed=None):
+    """
+    Load data with DistributedSampler for DDP training.
+    
+    This function is similar to load_data but uses DistributedSampler
+    when running in distributed mode to ensure each process gets
+    a different subset of the data.
+    
+    Args:
+        args: Arguments containing data_folder, nevts, seed, etc.
+        config: Configuration dictionary.
+        eval: If True, load evaluation data.
+        NN_embed: Optional neural network embedding model.
+        
+    Returns:
+        tuple: (loader_train, loader_val, train_sampler, val_sampler)
+               Samplers are returned for setting epoch in training loop.
+    """
+    import torch.distributed as dist
+    from torch.utils.data.distributed import DistributedSampler
+    
+    # First, load the data using the standard function
+    loader_train, loader_val = load_data(args, config, eval=eval, NN_embed=NN_embed)
+    
+    # If not in distributed mode, return with None samplers
+    if not dist.is_initialized() or get_world_size() == 1:
+        return loader_train, loader_val, None, None
+    
+    # Get the underlying datasets
+    train_dataset = loader_train.dataset
+    val_dataset = loader_val.dataset if loader_val is not None else None
+    
+    # Get batch size from config
+    batch_size = config.get("BATCH_MEANFLOW", config.get("BATCH", 256))
+    
+    # Create distributed samplers
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=get_world_size(),
+        rank=get_rank(),
+        shuffle=True
+    )
+    
+    val_sampler = None
+    if val_dataset is not None:
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=False
+        )
+    
+    # Recreate data loaders with distributed samplers
+    loader_train = torchdata.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        pin_memory=True,
+        num_workers=0,  # Be careful with num_workers in DDP
+        drop_last=True  # Drop last incomplete batch for consistent batch sizes
+    )
+    
+    loader_val = None
+    if val_dataset is not None:
+        loader_val = torchdata.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=val_sampler,
+            pin_memory=True,
+            num_workers=0,
+            drop_last=False
+        )
+    
+    return loader_train, loader_val, train_sampler, val_sampler
+
+
+def reduce_tensor(tensor, world_size=None):
+    """
+    Reduce a tensor across all processes by averaging.
+    
+    Args:
+        tensor: The tensor to reduce.
+        world_size: Number of processes (auto-detected if None).
+        
+    Returns:
+        The averaged tensor on all processes.
+    """
+    import torch.distributed as dist
+    
+    if not dist.is_initialized() or get_world_size() == 1:
+        return tensor
+    
+    if world_size is None:
+        world_size = get_world_size()
+    
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= world_size
+    return rt
+
+
+def barrier():
+    """Synchronize all processes."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
