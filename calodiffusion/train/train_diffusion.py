@@ -74,7 +74,9 @@ class TrainDiffusion(Train):
                     model_ref = self.model.module if self.use_ddp else self.model
                     noise = model_ref.gen_cold_image(E, cold_noise_scale, noise)
 
-                batch_loss = self.model.compute_loss(
+                # Access compute_loss from the model (unwrap DDP if needed)
+                model_ref = self.model.module if self.use_ddp else self.model
+                batch_loss = model_ref.compute_loss(
                     data=data, energy=E, noise=noise, layers=layers, time=t
                 )
                 batch_loss.backward()
@@ -128,7 +130,8 @@ class TrainDiffusion(Train):
                         model_ref = self.model.module if self.use_ddp else self.model
                         noise = model_ref.gen_cold_image(vE, cold_noise_scale, noise)
 
-                    batch_loss = self.model.compute_loss(
+                    model_ref = self.model.module if self.use_ddp else self.model
+                    batch_loss = model_ref.compute_loss(
                         vdata, vE, noise=noise, layers=vlayers, rnd_normal=rnd_normal,
                     )
 

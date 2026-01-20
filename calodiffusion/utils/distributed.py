@@ -136,16 +136,21 @@ def get_distributed_info_from_slurm():
     
     # Master node address
     # Get the first node from the node list
+    # Use scontrol to properly expand SLURM nodelist (handles bracket notation)
     nodelist = os.environ.get('SLURM_NODELIST', 'localhost')
-    # Simple parsing for single node or node range
-    # Handle formats like: node001, node001,node002, node[001-002], etc.
-    import re
-    # Match the first node name (before comma or bracket)
-    match = re.match(r'^([^,\[]+)', nodelist)
-    if match:
-        master_node = match.group(1)
-    else:
-        # Fallback to simple split
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['scontrol', 'show', 'hostname', nodelist],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            master_node = result.stdout.strip().split('\n')[0]
+        else:
+            # Fallback: just use the nodelist as-is if scontrol fails
+            master_node = nodelist.split(',')[0].split('[')[0]
+    except Exception:
+        # Fallback if subprocess fails
         master_node = nodelist.split(',')[0].split('[')[0]
     info['master_addr'] = master_node
     

@@ -40,10 +40,22 @@ class Dataset(IterableDataset):
         np.random.shuffle(self.files)
 
     def __iter__(self):
+        # Distributed training support: each rank gets a separate set of files
+        # to iterate over to avoid duplicate data across processes
+        import torch.distributed as dist
+        
+        files_to_read = list(self.files)
+        
+        # First, split files by DDP rank if running distributed
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            # Split files across ranks
+            files_to_read = [f for i, f in enumerate(files_to_read) if i % world_size == rank]
+        
         # Multi-worker support: each worker gets a separate set of files
-        # to iterate over to avoid double iterations
+        # to iterate over to avoid double iterations within a single process
         worker_info = torch.utils.data.get_worker_info()
-        files_to_read = self.files
         if worker_info is not None:
             files_to_read = np.array_split(files_to_read, worker_info.num_workers)[
                 worker_info.id

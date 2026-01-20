@@ -22,8 +22,24 @@ class Train(ABC):
         
         # Set device based on distributed setup
         if self.use_ddp:
-            self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.cuda.set_device(self.local_rank)
+            # Debug: print GPU binding info
+            import os as _os
+            print(f"[Rank {self.rank}] local_rank={self.local_rank}, "
+                  f"CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}, "
+                  f"SLURM_LOCALID={_os.environ.get('SLURM_LOCALID', 'not set')}")
+            
+            # If CUDA_VISIBLE_DEVICES is not set by SLURM, set it based on local_rank
+            # This ensures each process uses a different GPU
+            if 'CUDA_VISIBLE_DEVICES' not in _os.environ or _os.environ.get('CUDA_VISIBLE_DEVICES') == '':
+                _os.environ['CUDA_VISIBLE_DEVICES'] = str(self.local_rank)
+                self.device = torch.device("cuda:0")  # After setting CUDA_VISIBLE_DEVICES, use cuda:0
+                torch.cuda.set_device(0)
+            else:
+                self.device = torch.device(f"cuda:{self.local_rank}")
+                torch.cuda.set_device(self.local_rank)
+            
+            print(f"[Rank {self.rank}] Using device: {self.device}, "
+                  f"CUDA device count: {torch.cuda.device_count()}")
         else:
             self.device = utils.get_device()
         

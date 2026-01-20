@@ -979,41 +979,28 @@ def load_data(args, config, eval=False, NN_embed=None, distributed=False):
     dataset_train = Dataset(train_files)
     
     # Create distributed sampler if requested
+    # NOTE: IterableDataset doesn't support DistributedSampler or shuffle
+    # For distributed training with IterableDataset, each process will iterate
+    # through all files but the Dataset.__iter__ handles worker splitting
     sampler_train = None
     sampler_val = None
-    shuffle_train = True
     
-    if distributed:
-        sampler_train = torch.utils.data.distributed.DistributedSampler(
-            dataset_train,
-            shuffle=True
-        )
-        shuffle_train = False  # Sampler handles shuffling
-    
+    # IterableDataset does not support shuffle or sampler arguments
     loader_train = torchdata.DataLoader(
         dataset_train, 
         batch_size=batch_size, 
         pin_memory=True,
-        sampler=sampler_train,
-        shuffle=shuffle_train
     )
 
     loader_val = None
     if len(val_files) > 0:
         dataset_val = Dataset(val_files)
         
-        if distributed:
-            sampler_val = torch.utils.data.distributed.DistributedSampler(
-                dataset_val,
-                shuffle=False  # Don't shuffle validation data
-            )
-        
+        # IterableDataset does not support shuffle or sampler arguments
         loader_val = torchdata.DataLoader(
             dataset_val, 
             batch_size=batch_size, 
             pin_memory=True,
-            sampler=sampler_val,
-            shuffle=False
         )
 
     return loader_train, loader_val, sampler_train, sampler_val

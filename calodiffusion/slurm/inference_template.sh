@@ -49,8 +49,8 @@ export CALODIF_COMMAND="timeout 5.9h python3 $HOME/CaloDiffusion/calodiffusion/t
 export INF_COMMAND="python calodiffusion/inference.py  -c $CONFIG -d $TRAIN_DATA  sample --model-loc $CHECKPOINT_DIR/${MODEL}_Diffusion/checkpoint.pth --sample-algo DDim --sample-steps 200 --sample-file SAMPLE_FILE --sparse-decoding --batch-size $BATCH_SIZE -g $ODIR/batch_JOBNUM.h5 layer --layer-model $CHECKPOINT_DIR/${MODEL}_LayerModel/checkpoint.pth" 
 
 
-module load python
-conda activate calodif
+module load conda
+conda activate calo-diff
 
 cd $HOME/CaloDiffusion
 echo $INF_COMMAND
