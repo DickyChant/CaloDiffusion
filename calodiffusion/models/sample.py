@@ -1121,3 +1121,106 @@ class BespokeNonStationary(Sample):
         
         return self.sampler(start, debug=debug, offset=sample_offset)
 
+
+class meanflow(Sample):
+    """
+    MeanFlow sampler using ODE integration with Euler method.
+    
+    MeanFlow uses flow matching where the model predicts the velocity field v(x_t, t).
+    Sampling integrates from noise (t=1) to data (t=0) using Euler steps:
+        x_{t-dt} = x_t - dt * v(x_t, t)
+    
+    Config:
+        None (uses sample_steps for num_steps)
+    """
+    def __init__(self, config):
+        super().__init__(config)
+    
+    @torch.no_grad()
+    def __call__(
+        self, model, start, energy, layers, num_steps, sample_offset, debug
+    ):
+        """
+        Sample using MeanFlow ODE integration.
+        
+        Args:
+            model: CaloDiffusion model with meanflow=True
+            start: Initial noise tensor (B, ...)
+            energy: Conditioning energy tensor (B,)
+            layers: Optional layer conditioning
+            num_steps: Number of ODE integration steps
+            sample_offset: Not used for MeanFlow
+            debug: If True, return intermediate states
+        
+        Returns:
+            x: Final generated sample
+            xs: List of intermediate states (if debug)
+            x0s: Not used, returns None
+        """
+        device = start.device
+        batch_size = start.shape[0]
+        
+        # Start from noise at t=1
+        x = start
+        
+        # Time steps from t=1 to t=0
+        dt = 1.0 / num_steps
+        t_steps = torch.linspace(1.0, dt, num_steps, device=device)
+        
+        xs = [] if debug else None
+        
+        for t in t_steps:
+            # Create time tensor for batch
+            t_batch = torch.full((batch_size,), t, device=device)
+            
+            # Get velocity prediction from model
+            # In flow matching: x_t = (1-t) * x_1 + t * x_0
+            # Velocity: v = dx/dt = x_0 - x_1
+            # Model predicts x_0 given x_t and t
+            # So velocity is approximately (x_0_pred - x_t) / (1 - t) for t != 1
+            
+            # Using sigma-based interface: sigma ~ t for MeanFlow
+            x_pred = model.denoise(x, E=energy, sigma=t_batch, layers=layers)
+            
+            # Euler step: x_{t-dt} = x_t + dt * (x_pred - x) / t
+            # Simplified: move toward prediction
+            if t > dt:  # Avoid division by zero at last step
+                velocity = (x_pred - x) / t
+                x = x - dt * velocity
+            else:
+                x = x_pred  # Final step goes directly to prediction
+            
+            if debug:
+                xs.append(x.clone())
+        
+        return x, xs, None
+
+
+class meanflow_gmm(meanflow):
+    """
+    MeanFlow sampler with GMM prior.
+    
+    Similar to meanflow but starts from GMM prior samples instead of pure noise.
+    The GMM prior provides a better starting point that captures the data distribution.
+    
+    Config:
+        gmm_prior: Path to GMM prior checkpoint or tensor
+    """
+    def __init__(self, config):
+        super().__init__(config)
+        self.gmm_prior = config.get('gmm_prior', None)
+    
+    @torch.no_grad()
+    def __call__(
+        self, model, start, energy, layers, num_steps, sample_offset, debug
+    ):
+        """
+        Sample using MeanFlow with GMM prior.
+        
+        If GMM prior is available, use it as starting point instead of pure noise.
+        Otherwise falls back to standard MeanFlow sampling.
+        """
+        # GMM prior modifies the starting point, but the ODE integration is the same
+        # The start tensor should already be GMM-sampled if gmm_prior was provided
+        # Just call parent's sampling method
+        return super().__call__(model, start, energy, layers, num_steps, sample_offset, debug)

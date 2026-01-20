@@ -11,7 +11,7 @@ from scipy.ndimage import zoom
 from torch.func import jvp
 from einops import rearrange
 from calodiffusion.models.diffusion import Diffusion
-from calodiffusion.models.models import ResNet, CondUnet, PureDiT, MeanFlowDiT, cosine_beta_schedule, extract
+from calodiffusion.models.models import ResNet, CondUnet, PureDiT, MeanFlowDiT, MeanFlowDiT_v1, cosine_beta_schedule, extract
 from calodiffusion.models import models as models_module
 from calodiffusion.utils import sampling
 from calodiffusion.utils import utils
@@ -41,6 +41,9 @@ class CaloDiffusion(Diffusion):
         self.model = self.init_model()
         self.NN_embed = self.init_embedding_model()
         self.do_embed = self.NN_embed is not None and (not self.pre_embed)
+        
+        # Track if using MeanFlowDiT architecture (requires r parameter in forward)
+        self.is_meanflow_dit = self.shower_embed in ("MFAttn", "MFAttn_v1")
 
 
     def load_state_dict(self, state_dict, strict = True):
@@ -52,8 +55,9 @@ class CaloDiffusion(Diffusion):
         return super().load_state_dict(state_dict, strict)
     
     def init_model(self):
-
-        self.fully_connected = "FCN" in self.config.get("SHOWER_EMBED", "")
+        """Initialize the network model based on SHOWER_EMBED configuration."""
+        self.shower_embed = self.config.get("SHOWER_EMBED", "")
+        self.fully_connected = "FCN" in self.shower_embed
 
         if self.fully_connected: 
             model = ResNet(
@@ -71,41 +75,96 @@ class CaloDiffusion(Diffusion):
             if self.config.get("PHI_INPUT", False):
                 in_channels += 1
             
-            cond_size = 2 + self.config["SHAPE_FINAL"][2] if "layer" in self.config.get("SHOWERMAP", "") else 1
+            # Compute cond_size - use LEGACY_COND_SIZE for backward compatibility with old checkpoints
+            if self.config.get("LEGACY_COND_SIZE", False):
+                cond_size = 1  # Old checkpoints used only energy conditioning
+            else:
+                cond_size = 2 + self.config["SHAPE_FINAL"][2] if "layer" in self.config.get("SHOWERMAP", "") else 1
+                #extra conditioning info for hgcal
+                if(self.hgcal): cond_size +=2
             calo_summary_shape = [1, in_channels] + list(copy.copy(self.config["SHAPE_FINAL"][1:]))
 
-            #extra conditioning info for hgcal
-            if(self.hgcal): cond_size +=2
-
-            model = CondUnet(
-                cond_dim=self.config["COND_SIZE_UNET"],
-                out_dim=1,
-                channels=in_channels,
-                layer_sizes=self.config["LAYER_SIZE_UNET"],
-                block_attn=self.config.get("BLOCK_ATTN", False),
-                mid_attn= self.config.get("MID_ATTN", False),
-                cylindrical=self.config.get("CYLINDRICAL", False),
-                compress_Z=self.config.get("COMPRESS_Z", False),
-                resnet_block_groups=self.config.get("BLOCK_GROUPS", 8), 
-                data_shape=calo_summary_shape,
-                cond_embed=(self.config.get("COND_EMBED", "sin") == "sin"),
-                cond_size=cond_size,
-                time_embed=(self.config.get("TIME_EMBED", "sin") == "sin"),
-            ).to(device=self.device)
+            # Select model architecture based on SHOWER_EMBED
+            if "MFAttn" in self.shower_embed and "v1" not in self.shower_embed:
+                # MeanFlowDiT architecture for MeanFlow with attention
+                patch_shape = self.config.get("SHAPE_PAD", self.config["SHAPE_FINAL"])[2:]
+                model = MeanFlowDiT(
+                    hidden_dim=self.config["COND_SIZE_UNET"],
+                    in_dim=in_channels,
+                    depth=self.config.get("NUM_LAYERS", 4),
+                    num_heads=self.config.get("NUM_HEADS", 8),
+                    patch_shape=patch_shape,
+                    mlp_ratio=self.config.get("MLP_RATIO", 4.0),
+                    time_embed=(self.config.get("TIME_EMBED", "sin") == "sin"),
+                    cond_embed=(self.config.get("COND_EMBED", "sin") == "sin"),
+                ).to(device=self.device)
+                print(f"[CaloDiffusion] Initialized MeanFlowDiT with patch_shape={patch_shape}")
+                
+            elif "MFAttn_v1" in self.shower_embed:
+                # MeanFlowDiT_v1 architecture (alternate r embedding)
+                patch_shape = self.config.get("SHAPE_PAD", self.config["SHAPE_FINAL"])[2:]
+                model = MeanFlowDiT_v1(
+                    hidden_dim=self.config["COND_SIZE_UNET"],
+                    in_dim=in_channels,
+                    depth=self.config.get("NUM_LAYERS", 4),
+                    num_heads=self.config.get("NUM_HEADS", 8),
+                    patch_shape=patch_shape,
+                    mlp_ratio=self.config.get("MLP_RATIO", 4.0),
+                    time_embed=(self.config.get("TIME_EMBED", "sin") == "sin"),
+                    cond_embed=(self.config.get("COND_EMBED", "sin") == "sin"),
+                ).to(device=self.device)
+                print(f"[CaloDiffusion] Initialized MeanFlowDiT_v1 with patch_shape={patch_shape}")
+                
+            else:
+                # Default: CondUnet architecture
+                model = CondUnet(
+                    cond_dim=self.config["COND_SIZE_UNET"],
+                    out_dim=1,
+                    channels=in_channels,
+                    layer_sizes=self.config["LAYER_SIZE_UNET"],
+                    block_attn=self.config.get("BLOCK_ATTN", False),
+                    mid_attn= self.config.get("MID_ATTN", False),
+                    cylindrical=self.config.get("CYLINDRICAL", False),
+                    compress_Z=self.config.get("COMPRESS_Z", False),
+                    resnet_block_groups=self.config.get("BLOCK_GROUPS", 8), 
+                    data_shape=calo_summary_shape,
+                    cond_embed=(self.config.get("COND_EMBED", "sin") == "sin"),
+                    cond_size=cond_size,
+                    time_embed=(self.config.get("TIME_EMBED", "sin") == "sin"),
+                ).to(device=self.device)
 
         return model.to(self.device)
 
     def noise_generation(self, shape):
         return super().noise_generation(shape)
 
-    def forward(self, x, E, time, layers, controls=None):
+    def forward(self, x, E, time, layers=None, controls=None, r=None):
+        """Forward pass through the model.
+        
+        Args:
+            x: Input tensor
+            E: Energy conditioning
+            time: Time embedding
+            layers: Optional layer conditioning
+            controls: Optional control parameters
+            r: Optional r parameter for MeanFlowDiT (flow progress)
+        """
         if (self.do_embed):
             x = self.NN_embed.enc(x.to(torch.float32)).to(x.device)
         if (self.layer_cond) and (layers is not None):
             E = torch.cat([E, layers], dim=1)
 
         rz_phi = self.add_RZPhi(x).float()
-        out = self.model(rz_phi, cond=E.float(), time=time.float(), controls=controls)
+        
+        # MeanFlowDiT requires r parameter
+        if self.is_meanflow_dit:
+            # For MFDiT: model(data, cond=E, time=time, r=r)
+            # If r is None, default to 0 (endpoint of flow)
+            if r is None:
+                r = torch.zeros_like(time)
+            out = self.model(rz_phi, cond=E.float(), time=time.float(), r=r.float())
+        else:
+            out = self.model(rz_phi, cond=E.float(), time=time.float(), controls=controls)
 
         if (self.do_embed):
             out = self.NN_embed.dec(out).to(x.device)
@@ -166,12 +225,28 @@ class CaloDiffusion(Diffusion):
         }
         return embed[self.time_embed](sigma)
     
-    def denoise(self, x, E=None, sigma=None, layers = None, controls=None):
-        t_emb = self.do_time_embed(sigma = sigma.reshape(-1)).to(float)
+    def denoise(self, x, E=None, sigma=None, layers=None, controls=None, r=None):
+        """Denoise input x at noise level sigma.
+        
+        Args:
+            x: Noisy input tensor
+            E: Energy conditioning
+            sigma: Noise level (time parameter for MeanFlow)
+            layers: Optional layer conditioning
+            controls: Optional control parameters
+            r: Optional r parameter for MeanFlowDiT (flow progress)
+        """
+        t_emb = self.do_time_embed(sigma=sigma.reshape(-1)).to(float)
         loss_function_name = type(self.loss_function).__name__
+        
+        # For MeanFlowDiT, we need to pass r parameter
+        # If r is not provided for MFDiT, derive it from sigma
+        if self.is_meanflow_dit and r is None:
+            # For MeanFlow ODE, r can be derived from or equal to time/sigma
+            r = sigma.reshape(-1)
 
         scales = self.loss_function.get_scaling(sigma)
-        pred = self.forward(x * scales['c_in'], E, t_emb, layers = layers )
+        pred = self.forward(x * scales['c_in'], E, t_emb, layers=layers, r=r)
 
         if('noise_pred' in loss_function_name):
             return (x - sigma * pred)

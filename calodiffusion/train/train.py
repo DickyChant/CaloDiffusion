@@ -79,9 +79,13 @@ class Train(ABC):
             checkpoint = torch.load(self.flags.model_loc, map_location=self.device, weights_only=False)
 
         if "model_state_dict" in checkpoint.keys():
-            model.load_state_dict(checkpoint["model_state_dict"])
+            missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            if missing or unexpected:
+                print(f"[WARNING] Checkpoint loaded with mismatches - missing: {len(missing)}, unexpected: {len(unexpected)}")
         elif len(checkpoint.keys()) > 1:
-            model.load_state_dict(checkpoint)
+            missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+            if missing or unexpected:
+                print(f"[WARNING] Checkpoint loaded with mismatches - missing: {len(missing)}, unexpected: {len(unexpected)}")
 
         if "optimizer_state_dict" in checkpoint.keys() and not restart_training:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
