@@ -251,13 +251,20 @@ class TrainMeanFlow(Train):
         return self.model, epoch, training_losses, val_losses, optimizer, scheduler, early_stopper
 
 
-class TrainMeanFlowDDP(TrainMeanFlow):
+class TrainMeanFlowMultiGPU(TrainMeanFlow):
     """
-    Training class for MeanFlow diffusion model with DistributedDataParallel (DDP) support.
+    Training class for MeanFlow with multi-GPU support using manual gradient synchronization.
     
-    This class extends TrainMeanFlow to enable efficient multi-GPU training on a single node
-    or across multiple nodes. It uses PyTorch's DistributedDataParallel for gradient 
-    synchronization and DistributedSampler for data sharding.
+    This class extends TrainMeanFlow to enable multi-GPU training on a single node.
+    Unlike DDP, it does NOT wrap the model with DistributedDataParallel, which is 
+    important because MeanFlow uses JVP (Jacobian-vector product) that has 
+    compatibility issues with DDP's gradient hooks.
+    
+    Instead, this class:
+    1. Uses DistributedSampler to shard data across GPUs
+    2. Each GPU computes gradients independently (JVP works normally)
+    3. Manually synchronizes gradients using all-reduce after backward()
+    4. Only main process (rank 0) saves checkpoints
     
     Usage:
         # Launch with torchrun for multi-GPU training:
@@ -268,19 +275,15 @@ class TrainMeanFlowDDP(TrainMeanFlow):
     """
     
     def __init__(self, flags, config, load_data=True, save_model=True):
-        # Initialize DDP before everything else
+        # Initialize distributed environment before everything else
         self.rank, self.world_size, self.device = utils.setup_ddp()
         self.is_main = utils.is_main_process(self.rank)
         
         # Only main process should print
         if not self.is_main:
             import sys
-            # Suppress output on non-main processes
-            class NullWriter:
-                def write(self, s): pass
-                def flush(self): pass
             # Keep stderr for errors but suppress stdout
-            sys.stdout = NullWriter()
+            sys.stdout = utils.NullWriter()
         
         # Set save_model to True only for main process
         save_model = save_model and self.is_main
@@ -294,9 +297,9 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         # We do this to avoid double data loading
         Train.__init__(self, flags, config, load_data=False, save_model=save_model)
         
-        # Load data with DDP support
+        # Load data with distributed sampler support
         if load_data:
-            self._load_data_ddp(flags, config)
+            self._load_data_distributed(flags, config)
         
         # Load GMM prior if provided
         self.gmm_prior_data = None
@@ -307,15 +310,15 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         utils.barrier()
         
         if self.is_main:
-            print(f"[DDP] Initialized with {self.world_size} processes", flush=True)
+            print(f"[Multi-GPU] Initialized with {self.world_size} GPUs (no DDP wrapper for JVP compatibility)", flush=True)
     
-    def _load_data_ddp(self, flags, config):
-        """Load data with DistributedSampler for DDP training."""
+    def _load_data_distributed(self, flags, config):
+        """Load data with DistributedSampler for multi-GPU training."""
         import torch.utils.data as torchdata
         
         # First, load data using standard loader (only on main process if needed for caching)
         if self.is_main:
-            print("[DDP] Loading and preparing data...", flush=True)
+            print("[Multi-GPU] Loading and preparing data...", flush=True)
         
         # Load the data normally first
         loader_train, loader_val = utils.load_data(flags, config)
@@ -323,7 +326,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         # Synchronize to ensure data files are created
         utils.barrier()
         
-        # Now create DDP samplers and loaders
+        # Now create distributed samplers and loaders
         train_dataset = loader_train.dataset
         val_dataset = loader_val.dataset if loader_val is not None else None
         
@@ -333,7 +336,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         self.batch_size = batch_size
         
         if self.is_main:
-            print(f"[DDP] Using batch size {batch_size} per GPU (total effective: {batch_size * self.world_size})", flush=True)
+            print(f"[Multi-GPU] Using batch size {batch_size} per GPU (total effective: {batch_size * self.world_size})", flush=True)
         
         # Create distributed samplers
         self.train_sampler = DistributedSampler(
@@ -355,12 +358,13 @@ class TrainMeanFlowDDP(TrainMeanFlow):
             )
         
         # Create data loaders with distributed samplers
+        # Note: num_workers=0 to avoid issues with multiprocessing and NCCL
         self.loader_train = torchdata.DataLoader(
             train_dataset,
             batch_size=batch_size,
             sampler=self.train_sampler,
             pin_memory=True,
-            num_workers=0,  # Avoid issues with DDP and multiprocessing
+            num_workers=0,
             drop_last=True
         )
         
@@ -376,33 +380,45 @@ class TrainMeanFlowDDP(TrainMeanFlow):
             )
     
     def init_model(self):
-        """Initialize the CaloDiffusion model with DDP wrapper."""
+        """Initialize the CaloDiffusion model WITHOUT DDP wrapper (for JVP compatibility)."""
         shape = self.config.get("SHAPE_PAD")
         if shape is None:
             shape = self.config.get("SHAPE_FINAL")
         
-        # Remove batch dimension for model init
-        model_shape = shape[1:] if len(shape) > 1 else shape
-        
-        # Create model on the correct device
+        # Create model on the correct device for this process
         self.model = CaloDiffusion(
             self.config,
             n_steps=self.config.get("NSTEPS", 400),
             loss_type=self.config.get("LOSS_TYPE", "l2")
         ).to(device=self.device)
         
-        # Wrap model with DDP
-        # Note: find_unused_parameters=True may be needed if some parameters aren't used in every forward pass
-        self.model = utils.wrap_model_ddp(
-            self.model, 
-            device=self.device,
-            find_unused_parameters=True  # MeanFlow may not use all params in every forward
-        )
+        # Important: Do NOT wrap with DDP - JVP doesn't work with DDP hooks
+        # Instead, we manually synchronize gradients after backward()
+        if self.is_main:
+            print(f"[Multi-GPU] Model initialized on device {self.device} (no DDP wrapper)", flush=True)
+    
+    def _sync_gradients(self):
+        """Manually synchronize gradients across all processes using all-reduce."""
+        if self.world_size <= 1:
+            return
+        
+        for param in self.model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                param.grad.data /= self.world_size
+    
+    def _sync_model_params(self):
+        """Broadcast model parameters from rank 0 to all other processes."""
+        if self.world_size <= 1:
+            return
+        
+        for param in self.model.parameters():
+            dist.broadcast(param.data, src=0)
     
     def training_loop(
         self, optimizer, scheduler, early_stopper, start_epoch, num_epochs, training_losses, val_losses
     ):
-        """Training loop for MeanFlow model with DDP support."""
+        """Training loop for MeanFlow model with multi-GPU support (manual gradient sync)."""
         tqdm_func = utils.import_tqdm()
         cold_diffu = self.config.get("COLD_DIFFU", False)
         cold_noise_scale = self.config.get("COLD_NOISE", 1.0)
@@ -412,8 +428,8 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         
         min_validation_loss = 99999.0
         
-        # Get the underlying model for methods that don't work with DDP wrapper
-        unwrapped_model = utils.get_unwrapped_model(self.model)
+        # Ensure all processes start with the same model weights
+        self._sync_model_params()
         
         for epoch in range(start_epoch, num_epochs):
             # Set epoch for distributed sampler (ensures different shuffle each epoch)
@@ -447,7 +463,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                 noise = torch.randn_like(data)
                 
                 if cold_diffu:
-                    noise = unwrapped_model.gen_cold_image(E, cold_noise_scale, noise)
+                    noise = self.model.gen_cold_image(E, cold_noise_scale, noise)
                 
                 # Load GMM prior for this batch if using GMM
                 prior = None
@@ -469,22 +485,25 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                     
                     prior = prior_batch.to(device=self.device)
                 
-                # Compute loss using unwrapped model (jvp may have issues with DDP)
-                # The gradients will still be synchronized by DDP during backward
+                # Compute loss - JVP works here because model is not wrapped with DDP
                 if self.use_gmm and prior is not None:
-                    loss_vec, loss_ref = unwrapped_model.compute_loss_meanflow_gmm(
+                    loss_vec, loss_ref = self.model.compute_loss_meanflow_gmm(
                         data, E, gmm_prior=prior, noise=noise, 
                         energy_loss_scale=energy_loss_scale, layers=layers
                     )
                 else:
-                    loss_vec, loss_ref = unwrapped_model.compute_loss_meanflow(
+                    loss_vec, loss_ref = self.model.compute_loss_meanflow(
                         data, E, noise=noise, 
                         energy_loss_scale=energy_loss_scale, layers=layers
                     )
                 
                 batch_loss = loss_vec.mean()
                 
+                # Backward pass - computes gradients locally on this GPU
                 batch_loss.backward()
+                
+                # Manually synchronize gradients across all GPUs
+                self._sync_gradients()
                 
                 # Gradient clipping
                 grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=MAX_GRAD_NORM)
@@ -493,14 +512,14 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                 train_loss += batch_loss.detach()
                 num_batches += 1
                 
-                # Clean up GPU memory
+                # Clean up GPU memory (JVP is memory-intensive)
                 del data, E, layers, noise, batch_loss, loss_vec, loss_ref
                 if prior is not None:
                     del prior
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Reduce training loss across all processes
+            # Reduce training loss across all processes for logging
             train_loss = utils.reduce_tensor(train_loss, self.world_size)
             num_batches_total = utils.reduce_tensor(num_batches.float(), self.world_size)
             train_loss = (train_loss / num_batches_total).item()
@@ -530,7 +549,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                         noise = torch.randn_like(vdata)
                         
                         if cold_diffu:
-                            noise = unwrapped_model.gen_cold_image(vE, cold_noise_scale, noise)
+                            noise = self.model.gen_cold_image(vE, cold_noise_scale, noise)
                         
                         # Load GMM prior for validation batch if using GMM
                         vprior = None
@@ -552,12 +571,12 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                         
                         # Compute validation loss
                         if self.use_gmm and vprior is not None:
-                            loss_vec, loss_ref = unwrapped_model.compute_loss_meanflow_gmm(
+                            loss_vec, loss_ref = self.model.compute_loss_meanflow_gmm(
                                 vdata, vE, gmm_prior=vprior, noise=noise,
                                 energy_loss_scale=energy_loss_scale, layers=vlayers
                             )
                         else:
-                            loss_vec, loss_ref = unwrapped_model.compute_loss_meanflow(
+                            loss_vec, loss_ref = self.model.compute_loss_meanflow(
                                 vdata, vE, noise=noise,
                                 energy_loss_scale=energy_loss_scale, layers=vlayers
                             )
@@ -586,7 +605,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                 if val_loss < min_validation_loss:
                     if self.save_model:
                         torch.save(
-                            utils.get_model_state_dict(self.model),
+                            self.model.state_dict(),
                             os.path.join(self.checkpoint_folder, "best_val.pth")
                         )
                     min_validation_loss = val_loss
@@ -602,7 +621,7 @@ class TrainMeanFlowDDP(TrainMeanFlow):
                 self.model.eval()
                 print("SAVING", flush=True)
                 self.save(
-                    utils.get_model_state_dict(self.model),
+                    self.model.state_dict(),
                     epoch=epoch,
                     name="checkpoint",
                     training_losses=training_losses,
@@ -627,10 +646,13 @@ class TrainMeanFlowDDP(TrainMeanFlow):
         return self.model, epoch, training_losses, val_losses, optimizer, scheduler, early_stopper
     
     def train(self):
-        """Override train to add DDP cleanup."""
+        """Override train to add cleanup."""
         try:
             super().train()
         finally:
-            # Clean up DDP
+            # Clean up distributed environment
             utils.cleanup_ddp()
 
+
+# Alias for backward compatibility
+TrainMeanFlowDDP = TrainMeanFlowMultiGPU

@@ -9,10 +9,19 @@ import h5py as h5
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import sys
 import joblib
 import matplotlib.pyplot as plt
 import torch.utils.data as torchdata
+
+
+class NullWriter:
+    """Null writer for suppressing output on non-main DDP processes."""
+    def write(self, s): pass
+    def flush(self): pass
 
 
 def import_tqdm(): 
@@ -1081,11 +1090,10 @@ def setup_ddp(rank=None, world_size=None, backend='nccl'):
     Returns:
         tuple: (rank, world_size, device) for the current process.
     """
-    import torch.distributed as dist
-    
     # Check if already initialized
     if dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size(), torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+        local_rank = dist.get_rank() % torch.cuda.device_count()
+        return dist.get_rank(), dist.get_world_size(), torch.device(f"cuda:{local_rank}")
     
     # Get rank and world_size from environment if not provided
     if rank is None:
@@ -1118,14 +1126,12 @@ def setup_ddp(rank=None, world_size=None, backend='nccl'):
 
 def cleanup_ddp():
     """Clean up the distributed environment."""
-    import torch.distributed as dist
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def is_main_process(rank=None):
     """Check if this is the main process (rank 0)."""
-    import torch.distributed as dist
     if rank is not None:
         return rank == 0
     if dist.is_initialized():
@@ -1135,7 +1141,6 @@ def is_main_process(rank=None):
 
 def get_world_size():
     """Get the world size (number of processes)."""
-    import torch.distributed as dist
     if dist.is_initialized():
         return dist.get_world_size()
     return 1
@@ -1143,7 +1148,6 @@ def get_world_size():
 
 def get_rank():
     """Get the rank of the current process."""
-    import torch.distributed as dist
     if dist.is_initialized():
         return dist.get_rank()
     return 0
@@ -1151,7 +1155,6 @@ def get_rank():
 
 def get_ddp_device():
     """Get the device for the current DDP process."""
-    import torch.distributed as dist
     if dist.is_initialized():
         local_rank = dist.get_rank() % torch.cuda.device_count()
         return torch.device(f"cuda:{local_rank}")
@@ -1170,9 +1173,6 @@ def wrap_model_ddp(model, device=None, find_unused_parameters=False):
     Returns:
         The wrapped model (or original if not in distributed mode).
     """
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    
     if device is not None:
         model = model.to(device)
     
@@ -1191,7 +1191,6 @@ def wrap_model_ddp(model, device=None, find_unused_parameters=False):
 
 def get_model_state_dict(model):
     """Get the state dict from a model, handling DDP wrapper."""
-    from torch.nn.parallel import DistributedDataParallel as DDP
     if isinstance(model, DDP):
         return model.module.state_dict()
     return model.state_dict()
@@ -1199,7 +1198,6 @@ def get_model_state_dict(model):
 
 def get_unwrapped_model(model):
     """Get the underlying model from a DDP wrapper."""
-    from torch.nn.parallel import DistributedDataParallel as DDP
     if isinstance(model, DDP):
         return model.module
     return model
@@ -1223,9 +1221,6 @@ def load_data_ddp(args, config, eval=False, NN_embed=None):
         tuple: (loader_train, loader_val, train_sampler, val_sampler)
                Samplers are returned for setting epoch in training loop.
     """
-    import torch.distributed as dist
-    from torch.utils.data.distributed import DistributedSampler
-    
     # First, load the data using the standard function
     loader_train, loader_val = load_data(args, config, eval=eval, NN_embed=NN_embed)
     
@@ -1258,12 +1253,14 @@ def load_data_ddp(args, config, eval=False, NN_embed=None):
         )
     
     # Recreate data loaders with distributed samplers
+    # Note: num_workers=0 is used because multi-process data loading with DDP
+    # can cause issues with shared memory and NCCL initialization
     loader_train = torchdata.DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
         pin_memory=True,
-        num_workers=0,  # Be careful with num_workers in DDP
+        num_workers=0,
         drop_last=True  # Drop last incomplete batch for consistent batch sizes
     )
     
@@ -1292,8 +1289,6 @@ def reduce_tensor(tensor, world_size=None):
     Returns:
         The averaged tensor on all processes.
     """
-    import torch.distributed as dist
-    
     if not dist.is_initialized() or get_world_size() == 1:
         return tensor
     
@@ -1308,6 +1303,5 @@ def reduce_tensor(tensor, world_size=None):
 
 def barrier():
     """Synchronize all processes."""
-    import torch.distributed as dist
     if dist.is_initialized():
         dist.barrier()

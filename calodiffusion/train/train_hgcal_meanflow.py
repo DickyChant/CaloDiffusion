@@ -636,28 +636,40 @@ if __name__ == '__main__':
         print("Model %s not supported!" % flags.model)
         exit(1)
 
-    # Enable multi-GPU training using DDP if multiple GPUs are available
-    # DDP is preferred over DataParallel for MeanFlow training
+    # Multi-GPU training WITHOUT DDP wrapper (for JVP compatibility)
+    # MeanFlow uses JVP which has issues with DDP's gradient hooks
+    # Instead, we manually synchronize gradients after backward()
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     
-    # Wrap model with DDP if in distributed mode
+    # Do NOT wrap model with DDP - JVP doesn't work with it
     if world_size > 1:
-        local_rank = rank % num_gpus
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True  # MeanFlow may not use all params in every forward
-        )
         if is_main:
-            print(f"[DDP] Model wrapped with DistributedDataParallel", flush=True)
-            print(f"[DDP] Training on {world_size} processes with {num_gpus} GPUs per node", flush=True)
+            print(f"[Multi-GPU] Training on {world_size} processes with {num_gpus} GPUs", flush=True)
+            print(f"[Multi-GPU] Using manual gradient sync (no DDP wrapper for JVP compatibility)", flush=True)
     elif num_gpus > 1:
         print(f"[INFO] {num_gpus} GPUs detected but running in single-process mode", flush=True)
         print(f"[INFO] For multi-GPU training, use: torchrun --nproc_per_node={num_gpus} ...", flush=True)
         print(f"[INFO] Model will run on primary GPU: {device}", flush=True)
     else:
         print(f"[INFO] Using single GPU/CPU: {device}", flush=True)
+    
+    # Function to manually synchronize gradients across all GPUs
+    def sync_gradients(model):
+        """Average gradients across all processes."""
+        if world_size <= 1:
+            return
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                param.grad.data /= world_size
+    
+    # Function to broadcast model params from rank 0 to all others
+    def sync_model_params(model):
+        """Broadcast model parameters from rank 0."""
+        if world_size <= 1:
+            return
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
     
     # Helper function to get the actual model (handles DDP and DataParallel)
     def get_model(model):
@@ -670,6 +682,9 @@ if __name__ == '__main__':
         if isinstance(model, (DDP, nn.DataParallel)):
             return model.module.state_dict()
         return model.state_dict()
+    
+    # Ensure all processes start with same model weights
+    sync_model_params(model)
 
     # Backup config file (only main process)
     if is_main:
@@ -760,6 +775,9 @@ if __name__ == '__main__':
             loss_pidm_value = loss_pidm_vec.mean().item() if loss_pidm_vec is not None else None
             
             batch_loss.backward()
+            
+            # Manually synchronize gradients across all GPUs (for JVP compatibility)
+            sync_gradients(model)
 
             # --- grad clipping (after backward, before step) ---
             grad_norm = clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)

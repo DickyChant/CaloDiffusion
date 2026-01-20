@@ -90,9 +90,6 @@ def layer(ctx, layer_model_loc):
     if (layer_model_loc is not None) and ctx.obj.load: 
         ctx.obj.config['layer_model'] = layer_model_loc 
 
-    #self.layer_steps = self.config.get("LAYER_STEPS")
-    #sampler_algo = self.config.get("LAYER_SAMPLER", "DDim")
-
     TrainLayerModel(ctx.obj, ctx.obj.config).train()
 
 
@@ -108,10 +105,18 @@ def meanflow(ctx):
 @click.pass_context
 def meanflow_ddp(ctx):
     """
-    Train MeanFlow diffusion model with multi-GPU support using DDP.
+    Train MeanFlow diffusion model with multi-GPU support.
     
-    This command enables efficient multi-GPU training on a single node or 
-    across multiple nodes using PyTorch's DistributedDataParallel (DDP).
+    This command enables multi-GPU training on a single node using manual
+    gradient synchronization. Unlike standard DDP, the model is NOT wrapped
+    with DistributedDataParallel because MeanFlow uses JVP (Jacobian-vector
+    product) which has compatibility issues with DDP's gradient hooks.
+    
+    Instead, this approach:
+    - Uses DistributedSampler to shard data across GPUs
+    - Each GPU computes gradients independently (JVP works normally)  
+    - Manually synchronizes gradients using all-reduce after backward()
+    - Only main process (rank 0) saves checkpoints
     
     Usage:
     
@@ -119,19 +124,6 @@ def meanflow_ddp(ctx):
     # Single node, multi-GPU (4 GPUs):
     torchrun --nproc_per_node=4 -m calodiffusion.training \\
         -c config.json -d /path/to/data meanflow-ddp
-    
-    \b
-    # Multi-node training (2 nodes, 4 GPUs each):
-    # On node 0:
-    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 \\
-        --master_addr=<master_ip> --master_port=29500 \\
-        -m calodiffusion.training -c config.json meanflow-ddp
-    
-    \b
-    # On node 1:
-    torchrun --nnodes=2 --nproc_per_node=4 --node_rank=1 \\
-        --master_addr=<master_ip> --master_port=29500 \\
-        -m calodiffusion.training -c config.json meanflow-ddp
     
     The batch size per GPU can be configured using BATCH_MEANFLOW in the config.
     The effective total batch size will be BATCH_MEANFLOW * num_gpus.
