@@ -149,7 +149,55 @@ def plot(ctx, generated, plot_label, plot_folder, plot_reshape, extension, cms, 
     plot_results(flags, ctx.obj.config, data_dict, energies)
 
 
+@inference.command()
+@click.option("-g", "--generated", default="", required=True, help="Path to generated results for evaluation")
+@click.option("--plot-folder", default="./plots", help="Folder to save results")
+@click.option("--geant-only", default=False, is_flag=True, help="Plots with just geant")
+@click.option("--fpd", default=False, is_flag=True, help="Compute FPD/KPD")
+@click.option("--cls-n-iters", default=1, type=int, help='Num classifiers to train')
+@click.option("--cls-n-epochs", default=50, type=int, help='Num classifier epochs')
+@click.option("--cls-batch-size", default=256, type=int, help='classifier batch size')
+@click.option("--plot", default=False, is_flag=True, help='Save 1D feature plots')
+@click.pass_context
+def evaluate(ctx, generated, plot_folder, geant_only, fpd, cls_n_iters, cls_n_epochs, cls_batch_size, plot):
+    """Evaluate generated showers using physics metrics (High Level Features, Classifiers, FPD/KPD)."""
+    
+    # Construct the command to run hgcal_metrics.py
+    # This avoids modifying hgcal_metrics.py to be importable
+    
+    script_path = os.path.join(os.path.dirname(__file__), "tests/hgcal_metrics.py")
+    
+    config_path = ctx.parent.params.get('config')
+    if config_path is None:
+         print("Warning: Config file path required for evaluation. Ensure -c/--config was passed to parent command.")
+         return
 
+    cmd = f"python {script_path} --config {config_path} --generated {generated} --plot_folder {plot_folder} --data_folder {ctx.obj.data_folder}"
+    
+    if geant_only:
+        cmd += " --geant_only"
+    if fpd:
+        cmd += " --fpd"
+    if plot:
+        cmd += " --plot"
+        
+    cmd += f" --cls_n_iters {cls_n_iters}"
+    cmd += f" --cls_n_epochs {cls_n_epochs}"
+    cmd += f" --cls_batch_size {cls_batch_size}"
+    
+    if ctx.obj.nevts > 0:
+        cmd += f" --nevts {ctx.obj.nevts}"
+        
+    # Pass other potentially useful flags
+    if ctx.obj.get('plot_label'):
+        cmd += f" --plot_label '{ctx.obj.plot_label}'"
+    if ctx.obj.get('EMin', -1.0) > 0:
+        cmd += f" --EMin {ctx.obj.EMin}"
+    if ctx.obj.layer_only:
+        cmd += " --layer_only"
+        
+    print(f"Running evaluation command: {cmd}")
+    os.system(cmd)
 
 
 def process_data_dict(flags, config): 

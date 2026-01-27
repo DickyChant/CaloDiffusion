@@ -5,6 +5,8 @@ import argparse
 import h5py as h5
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.optim as optim
 import torch.utils.data as torchdata
 from torch.nn.utils import clip_grad_norm_
@@ -18,8 +20,20 @@ from calodiffusion.models.calodiffusion import CaloDiffu
 if __name__ == '__main__':
     print("TRAIN DIFFU")
 
-    if(torch.cuda.is_available()): device = torch.device('cuda')
-    else: device = torch.device('cpu')
+    # --- DDP setup (torchrun) ---
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_ddp = world_size > 1
+    if use_ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def is_main_process():
+        return (not use_ddp) or rank == 0
         
     parser = argparse.ArgumentParser()
     
@@ -57,8 +71,9 @@ if __name__ == '__main__':
         print(f"  New: {flags.files}", flush=True)
         print(f"  Total files: {len(flags.files)}", flush=True)
 
-    print("TRAINING OPTIONS")
-    print(dataset_config, flush = True)
+    if is_main_process():
+        print("TRAINING OPTIONS")
+        print(dataset_config, flush = True)
 
     torch.manual_seed(flags.seed)
 
@@ -72,9 +87,11 @@ if __name__ == '__main__':
     # DataParallel doesn't help with jvp since it runs on single GPU
     default_batch_meanflow = min(32, dataset_config.get('BATCH', 256) // 4)  # Much smaller default
     batch_size = dataset_config.get('BATCH_MEANFLOW', default_batch_meanflow)
-    print(f"Using batch size {batch_size} for MeanFlow training (jvp is memory-intensive)", flush=True)
+    if is_main_process():
+        print(f"Using batch size {batch_size} for MeanFlow training (jvp is memory-intensive)", flush=True)
     if batch_size > 64:
-        print(f"[WARNING] Batch size {batch_size} may be too large for jvp. Consider reducing BATCH_MEANFLOW in config.", flush=True)
+        if is_main_process():
+            print(f"[WARNING] Batch size {batch_size} may be too large for jvp. Consider reducing BATCH_MEANFLOW in config.", flush=True)
     
     num_epochs = dataset_config['MAXEPOCH']
     early_stop = dataset_config['EARLYSTOP']
@@ -85,6 +102,9 @@ if __name__ == '__main__':
     orig_shape = ('orig' in shower_embed)
     energy_loss_scale = dataset_config.get('ENERGY_LOSS_SCALE', 0.0)
     weight_pidm = dataset_config.get('WEIGHT_PIDM', flags.weight_pidm)
+    use_pidm = dataset_config.get('USE_PIDM', True)
+    if not use_pidm:
+        weight_pidm = 0.0
     
     # Check if pre-embedding is needed
     pre_embed = ('pre-embed' in shower_embed) or ('NN' in shower_embed)
@@ -103,7 +123,8 @@ if __name__ == '__main__':
             device=device,
         ).to(device=device)
         NN_embed.init(norm=True, dataset_num=dataset_num)
-        print(f"Initialized HGCalConverter for pre-embedding: {geom_file}", flush=True)
+        if is_main_process():
+            print(f"Initialized HGCalConverter for pre-embedding: {geom_file}", flush=True)
     
     # Will initialize GMM model after detecting data format
     gmm_model = None
@@ -113,6 +134,7 @@ if __name__ == '__main__':
 
     data = []
     energies = []
+    layers = [] if use_pidm else None
     prior = [] if use_gmm else None
     
     # Determine expected raw spatial size for GMM prior conversion
@@ -136,7 +158,8 @@ if __name__ == '__main__':
                         expected_raw_spatial_size = raw_data_sample.shape[2]
                         print(f"[WARNING] MAX_CELLS not in config, detected from data file: {expected_raw_spatial_size}", flush=True)
         
-        print(f"[INFO] Using MAX_CELLS from config for embedding: {expected_raw_spatial_size}", flush=True)
+        if is_main_process():
+            print(f"[INFO] Using MAX_CELLS from config for embedding: {expected_raw_spatial_size}", flush=True)
 
     for i, dataset in enumerate(dataset_config['FILES']):
         # Load data
@@ -176,7 +199,8 @@ if __name__ == '__main__':
                         detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2], raw_data_sample.shape[3])  # (layers, H, W)
                     else:
                         raise ValueError(f"Unexpected raw data shape: {raw_data_sample.shape}")
-                print(f"[INFO] Detected voxel shape: {detected_voxel_shape}", flush=True)
+                if is_main_process():
+                    print(f"[INFO] Detected voxel shape: {detected_voxel_shape}", flush=True)
             
             # Initialize GMM model once
             if gmm_model is None:
@@ -195,7 +219,8 @@ if __name__ == '__main__':
                         f"not the H5 prior file. The code will sample from the checkpoint on-the-fly."
                     )
                 
-                print(f"[INFO] Loading GMM checkpoint from: {gmm_ckpt_path}", flush=True)
+                if is_main_process():
+                    print(f"[INFO] Loading GMM checkpoint from: {gmm_ckpt_path}", flush=True)
                 try:
                     # Load checkpoint (weights_only=False because checkpoint contains model state, mean, std, etc.)
                     ckpt = torch.load(gmm_ckpt_path, map_location=device, weights_only=False)
@@ -238,8 +263,9 @@ if __name__ == '__main__':
                 gmm_model.eval()
                 gmm_mean = ckpt['mean']
                 gmm_std = ckpt['std']
-                print(f"[INFO] Loaded GMM model from checkpoint: {gmm_ckpt_path}", flush=True)
-                print(f"[INFO] GMM: cond_dim={ckpt['cond_dim']}, data_dim={data_dim}, K={ckpt['K']}, hidden={ckpt['hidden']}", flush=True)
+                if is_main_process():
+                    print(f"[INFO] Loaded GMM model from checkpoint: {gmm_ckpt_path}", flush=True)
+                    print(f"[INFO] GMM: cond_dim={ckpt['cond_dim']}, data_dim={data_dim}, K={ckpt['K']}, hidden={ckpt['hidden']}", flush=True)
             
             # Sample from GMM using the same energies as data
             n_events = data_.shape[0]
@@ -291,8 +317,9 @@ if __name__ == '__main__':
             # Apply shower_scale if needed
             prior_raw = prior_raw * shower_scale
             
-            print(f"Prior raw shape: {prior_raw.shape}", flush=True)
-            print(f"Data shape after embedding: {data_.shape}", flush=True)
+            if is_main_process():
+                print(f"Prior raw shape: {prior_raw.shape}", flush=True)
+                print(f"Data shape after embedding: {data_.shape}", flush=True)
             
             # Check if prior is already in embedded format (matches data shape)
             expected_embedded_shape = data_.shape[1:] if data_.ndim > 1 else None
@@ -305,7 +332,8 @@ if __name__ == '__main__':
             
             if prior_already_embedded:
                 # Prior is already in embedded format, just preprocess
-                print("Prior is already in embedded format, skipping embedding", flush=True)
+                if is_main_process():
+                    print("Prior is already in embedded format, skipping embedding", flush=True)
                 prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
                     prior_raw,
                     e_prior,
@@ -321,10 +349,12 @@ if __name__ == '__main__':
                 # Check if prior is in (N, layers, spatial_2d) format - need to flatten to (N, layers, spatial_1d)
                 if prior_raw.ndim == 4 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
                     # Prior is in (N, 47, H, W) format - flatten spatial dimensions to (N, 47, H*W)
-                    print(f"Reshaping prior from {prior_raw.shape} to raw format for embedding", flush=True)
+                    if is_main_process():
+                        print(f"Reshaping prior from {prior_raw.shape} to raw format for embedding", flush=True)
                     n_events_prior, n_layers, h, w = prior_raw.shape
                     prior_raw = prior_raw.reshape(n_events_prior, n_layers, h * w)
-                    print(f"Prior reshaped to: {prior_raw.shape}", flush=True)
+                    if is_main_process():
+                        print(f"Prior reshaped to: {prior_raw.shape}", flush=True)
                 
                 # Check if prior has compatible shape for embedding (N, 47, spatial_size)
                 if prior_raw.ndim == 3 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
@@ -334,8 +364,9 @@ if __name__ == '__main__':
                     
                     # Intelligently handle size mismatch using actual input data size
                     if actual_spatial_size != expected_spatial_size:
-                        print(f"[INFO] Prior spatial size mismatch: {actual_spatial_size} vs expected {expected_spatial_size}", flush=True)
-                        print(f"[INFO] Intelligently converting prior to match actual data format...", flush=True)
+                        if is_main_process():
+                            print(f"[INFO] Prior spatial size mismatch: {actual_spatial_size} vs expected {expected_spatial_size}", flush=True)
+                            print(f"[INFO] Intelligently converting prior to match actual data format...", flush=True)
                         
                         # Smart conversion: pad with zeros if smaller, crop if larger
                         # This preserves the existing data and pads/crops appropriately
@@ -394,22 +425,41 @@ if __name__ == '__main__':
         if(i ==0): 
             data = data_
             energies = e_
+            if use_pidm:
+                layers = layers_
             if use_gmm:
                 prior = prior_
         else:
             data = np.concatenate((data, data_))
             energies = np.concatenate((energies, e_))
+            if use_pidm:
+                layers = np.concatenate((layers, layers_))
             if use_gmm:
                 prior = np.concatenate((prior, prior_))
         
     avg_showers = std_showers = E_bins = None
     # NN_embed already initialized above if pre_embed is True
 
-    energies = np.reshape(energies,(-1))    
+    energies = np.reshape(energies,(-1))
+
+    # Fallback: if data is still in raw HGCal format (N, layers, cells), preprocess now
+    if (not orig_shape) and dataset_config.get('HGCAL', False) and data.ndim == 3:
+        print("[WARNING] Data appears unprocessed (raw HGCal shape). Applying preprocess_hgcal_shower...", flush=True)
+        data, energies = HGCal_utils.preprocess_hgcal_shower(
+            data,
+            energies,
+            dataset_config['SHAPE_PAD'],
+            dataset_config['SHOWERMAP'],
+            dataset_num=dataset_num,
+            orig_shape=orig_shape,
+            ecut=dataset_config.get('ECUT', 0),
+            max_deposit=dataset_config['MAXDEP'],
+        )
     
     # Check current data shape
-    print(f"Data shape before reshape: {data.shape}")
-    print(f"Data size: {data.size}")
+    if is_main_process():
+        print(f"Data shape before reshape: {data.shape}")
+        print(f"Data size: {data.size}")
     
     dshape = dataset_config['SHAPE_PAD'].copy() if isinstance(dataset_config['SHAPE_PAD'], list) else list(dataset_config['SHAPE_PAD'])
     
@@ -420,17 +470,19 @@ if __name__ == '__main__':
         # Calculate number of samples from total size
         num_samples = data.size // expected_elements_per_sample
         
-        print(f"Expected elements per sample: {expected_elements_per_sample}")
-        print(f"Calculated number of samples: {num_samples}")
-        print(f"Original target shape: {dshape}")
+        if is_main_process():
+            print(f"Expected elements per sample: {expected_elements_per_sample}")
+            print(f"Calculated number of samples: {num_samples}")
+            print(f"Original target shape: {dshape}")
         
         # Replace -1 with calculated number of samples
         if dshape[0] == -1:
             dshape[0] = num_samples
         
-        print(f"Final reshape target: {tuple(dshape)}")
-        print(f"Expected total size: {np.prod(dshape)}")
-        print(f"Actual data size: {data.size}")
+        if is_main_process():
+            print(f"Final reshape target: {tuple(dshape)}")
+            print(f"Expected total size: {np.prod(dshape)}")
+            print(f"Actual data size: {data.size}")
         
         # Verify the reshape is possible
         if data.size % expected_elements_per_sample != 0:
@@ -442,10 +494,12 @@ if __name__ == '__main__':
         
         if data.size != np.prod(dshape):
             # Try to reshape with -1 to let numpy figure it out
-            print(f"Warning: Size mismatch. Attempting reshape with -1 for first dimension...")
+            if is_main_process():
+                print(f"Warning: Size mismatch. Attempting reshape with -1 for first dimension...")
             dshape_auto = [-1] + dshape[1:]
             data = np.reshape(data, tuple(dshape_auto))
-            print(f"Reshaped to: {data.shape}")
+            if is_main_process():
+                print(f"Reshaped to: {data.shape}")
         else:
             data = np.reshape(data, tuple(dshape))
         
@@ -461,40 +515,71 @@ if __name__ == '__main__':
             prior = np.reshape(prior, (prior.shape[0], -1))
 
     num_data = data.shape[0]
-    print("Data Shape " + str(data.shape))
+    if is_main_process():
+        print("Data Shape " + str(data.shape))
     data_size = data.shape[0]
 
     # Prepare torch tensors
     torch_data_tensor = torch.from_numpy(data)
     torch_E_tensor = torch.from_numpy(energies)
+    if use_pidm:
+        torch_layers_tensor = torch.from_numpy(layers)
     
-    if use_gmm:
+    if use_gmm and is_main_process():
         prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
         torch_data_tensor = torch_data_tensor.cpu()
         torch_E_tensor = torch_E_tensor.cpu()
+        if use_pidm:
+            torch_layers_tensor = torch_layers_tensor.cpu()
         print("DATA mean, sum, std, shape", torch.mean(torch_data_tensor), torch.sum(prior_flat_all),torch.std(torch_data_tensor), torch_data_tensor.shape)
         print("PRIOR mean, sum, std, shape", torch.mean(prior_flat_all),torch.sum(prior_flat_all), torch.std(prior_flat_all), prior_flat_all.shape)
         print(f'prior shape {prior_flat_all.shape}')
+    elif use_gmm:
+        prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
+        torch_data_tensor = torch_data_tensor.cpu()
+        torch_E_tensor = torch_E_tensor.cpu()
+        if use_pidm:
+            torch_layers_tensor = torch_layers_tensor.cpu()
     
     del data
     if use_gmm:
         del prior
+    if use_pidm:
+        del layers
 
     # Create dataset
     if use_gmm:
-        torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all)
+        if use_pidm:
+            torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all, torch_layers_tensor)
+        else:
+            torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all)
         del prior_flat_all
     else:
-        torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor)
+        if use_pidm:
+            torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor, torch_layers_tensor)
+        else:
+            torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor)
     
     nTrain = int(round(flags.frac * num_data))
     nVal = num_data - nTrain
-    train_dataset, val_dataset = torch.utils.data.random_split(torch_dataset, [nTrain, nVal])
+    split_gen = torch.Generator().manual_seed(flags.seed)
+    train_dataset, val_dataset = torch.utils.data.random_split(torch_dataset, [nTrain, nVal], generator=split_gen)
 
-    loader_train = torchdata.DataLoader(train_dataset, batch_size = batch_size, shuffle = True)
-    loader_val = torchdata.DataLoader(val_dataset, batch_size = batch_size, shuffle = True)
+    # Avoid batch_size=1 for PIDM + layer maps (ReverseNormHGCal squeezes batch dim)
+    drop_last = use_pidm and ("layer" in dataset_config.get("SHOWERMAP", ""))
+    if use_ddp:
+        train_sampler = torchdata.distributed.DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+        val_sampler = torchdata.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+        loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=False, drop_last=drop_last)
+        loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, shuffle=False, drop_last=drop_last)
+    else:
+        train_sampler = None
+        loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
+        loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
 
     del torch_data_tensor, torch_E_tensor, train_dataset, val_dataset
+    if use_pidm:
+        del torch_layers_tensor
     
     # Use provided checkpoint folder or default to ../models/{CHECKPOINT_NAME}_{model}/
     if flags.checkpoint is not None:
@@ -512,12 +597,14 @@ if __name__ == '__main__':
     checkpoint = dict()
     checkpoint_path = os.path.join(checkpoint_folder, "checkpoint.pth")
     if(flags.load and os.path.exists(checkpoint_path)): 
-        print("Loading training checkpoint from %s" % checkpoint_path, flush = True)
+        if is_main_process():
+            print("Loading training checkpoint from %s" % checkpoint_path, flush = True)
         try:
             checkpoint = torch.load(checkpoint_path, map_location = device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(checkpoint_path, map_location = device)
-        print(checkpoint.keys())
+        if is_main_process():
+            print(checkpoint.keys())
 
     if(flags.model == "Diffu"):
         shape = dataset_config['SHAPE_PAD'][1:] if (not orig_shape) else dataset_config['SHAPE_ORIG'][1:]
@@ -531,40 +618,45 @@ if __name__ == '__main__':
         print("Model %s not supported!" % flags.model)
         exit(1)
 
-    # Enable multi-GPU training if multiple GPUs are available
-    # DISABLE DataParallel for MeanFlow: jvp (used in loss computation) doesn't work with DataParallel
-    # See: https://github.com/pytorch/pytorch/issues/102197
-    # However, we use manual multi-GPU splitting in _parallel_jvp to utilize multiple GPUs
+    # If PIDM needs layerE but the model can't accept layer conditioning (cond_size=1),
+    # disable layer conditioning to avoid shape mismatch in pred_meanflow.
+    if use_pidm and model.layer_cond and is_main_process():
+        print("[WARNING] Disabling layer conditioning for PIDM to avoid cond_mlp shape mismatch.", flush=True)
+        model.layer_cond = False
+    elif use_pidm and model.layer_cond:
+        model.layer_cond = False
+
+    # MeanFlow jvp is not compatible with DataParallel by default.
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if num_gpus > 1:
-        print(f"[INFO] {num_gpus} GPUs detected for MeanFlow training", flush=True)
-        print(f"[INFO] DataParallel DISABLED (jvp incompatible), but using manual multi-GPU batch splitting", flush=True)
-        print(f"[INFO] Batches will be split across {num_gpus} GPUs during jvp computation", flush=True)
-        print(f"[INFO] Model will run on primary GPU: {device}", flush=True)
+    if use_ddp:
+        if is_main_process():
+            print(f"[INFO] {num_gpus} GPUs detected for MeanFlow training", flush=True)
+            print(f"[INFO] Using DistributedDataParallel (DDP)", flush=True)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
     else:
-        print(f"[INFO] Using single GPU/CPU: {device}", flush=True)
-    
-    # Don't wrap model in DataParallel - jvp doesn't work with it
-    # But _parallel_jvp will manually split batches across GPUs
-    
+        if is_main_process():
+            print(f"[INFO] Using single GPU/CPU: {device}", flush=True)
+
     # Helper function to get the actual model (handles DataParallel)
     def get_model(model):
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, (nn.DataParallel, DDP)):
             return model.module
         return model
-    
+
     # Helper function to get model state dict (handles DataParallel)
     def get_model_state_dict(model):
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, (nn.DataParallel, DDP)):
             return model.module.state_dict()
         return model.state_dict()
 
     # Backup config file
-    os.system('cp {} {}'.format(flags.config,checkpoint_folder)) # bkp of config file
+    if is_main_process():
+        os.system('cp {} {}'.format(flags.config,checkpoint_folder)) # bkp of config file
 
     early_stopper = utils.EarlyStopper(patience = dataset_config['EARLYSTOP'], mode = 'diff', min_delta = 1e-5)
     if('early_stop_dict' in checkpoint.keys() and not flags.reset_training): early_stopper.__dict__ = checkpoint['early_stop_dict']
-    print(early_stopper.__dict__)
+    if is_main_process():
+        print(early_stopper.__dict__)
     
 
     criterion = nn.MSELoss().to(device = device)
@@ -590,28 +682,43 @@ if __name__ == '__main__':
     
     #training loop
     for epoch in range(start_epoch, num_epochs):
-        print("Beginning epoch %i" % epoch, flush=True)
+        if use_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_main_process():
+            print("Beginning epoch %i" % epoch, flush=True)
         for i, param in enumerate(model.parameters()):
             break
         train_loss = 0
 
         model.train()
-        train_pbar = tqdm(enumerate(loader_train, 0),
-                          unit="batch",
-                          total=len(loader_train))
+        train_iter = enumerate(loader_train, 0)
+        if is_main_process():
+            train_pbar = tqdm(train_iter, unit="batch", total=len(loader_train))
+        else:
+            train_pbar = train_iter
         for i, batch in train_pbar:
             model.zero_grad()
             optimizer.zero_grad()
 
             if use_gmm:
-                data, E, prior = batch
+                if use_pidm:
+                    data, E, prior, layers = batch
+                else:
+                    data, E, prior = batch
                 data = data.to(device = device)
                 E = E.to(device = device)
                 prior = prior.to(device = device)
+                if use_pidm:
+                    layers = layers.to(device=device)
             else:
-                E, data = batch
+                if use_pidm:
+                    E, data, layers = batch
+                else:
+                    E, data = batch
                 data = data.to(device = device)
                 E = E.to(device = device)
+                if use_pidm:
+                    layers = layers.to(device=device)
 
             noise = torch.randn_like(data)
 
@@ -619,17 +726,27 @@ if __name__ == '__main__':
             actual_model = get_model(model)
             loss_pidm_vec = None
             if use_gmm:
-                # For GMM, check if there's a PIDM version
-                if hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
-                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(data, E, gmm_prior=prior, noise = noise, energy_loss_scale = energy_loss_scale)
+                if use_pidm and hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(
+                        data, E, gmm_prior=prior, noise=noise, energy_loss_scale=energy_loss_scale, layers=layers if use_pidm else None
+                    )
                     batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
                 else:
-                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(data, E, gmm_prior=prior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(
+                        data, E, gmm_prior=prior, noise=noise, energy_loss_scale=energy_loss_scale, layers=layers if use_pidm else None
+                    )
                     batch_loss = loss_vec.mean()
             else:
-                # Use PIDM version which includes physics constraints
-                loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(data, E, noise = noise, energy_loss_scale = energy_loss_scale)
-                batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                if use_pidm and hasattr(actual_model, 'compute_loss_meanflow_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(
+                        data, E, noise=noise, energy_loss_scale=energy_loss_scale, layers=layers if use_pidm else None
+                    )
+                    batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                else:
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow(
+                        data, E, noise=noise, energy_loss_scale=energy_loss_scale, layers=layers if use_pidm else None
+                    )
+                    batch_loss = loss_vec.mean()
             
             batch_loss_ref = loss_ref.mean()
             
@@ -638,6 +755,7 @@ if __name__ == '__main__':
             batch_loss_ref_value = batch_loss_ref.item()
             loss_pidm_value = loss_pidm_vec.mean().item() if loss_pidm_vec is not None else None
             
+            # Standard backward pass - DataParallel handles gradient synchronization!
             batch_loss.backward()
 
             # --- grad clipping (after backward, before step) ---
@@ -652,6 +770,8 @@ if __name__ == '__main__':
                 del loss_pidm_vec
             if use_gmm:
                 del prior
+            if use_pidm:
+                del layers
             del data, E
             
             # Clear cache every step (not just every 10) - jvp needs aggressive cleanup
@@ -662,37 +782,57 @@ if __name__ == '__main__':
             train_loss += batch_loss_value
 
             # progress bar
-            if loss_pidm_value is not None:
-                train_pbar.set_postfix(
-                    loss=f"{batch_loss_value:.4f}",
-                    ref_loss=f"{batch_loss_ref_value:.4f}",
-                    pidm_loss=f"{loss_pidm_value:.4f}",
-                )
-            else:
-                train_pbar.set_postfix(
-                    loss=f"{batch_loss_value:.4f}",
-                    ref_loss=f"{batch_loss_ref_value:.4f}",
-                )
+            if is_main_process():
+                if loss_pidm_value is not None:
+                    train_pbar.set_postfix(
+                        loss=f"{batch_loss_value:.4f}",
+                        ref_loss=f"{batch_loss_ref_value:.4f}",
+                        pidm_loss=f"{loss_pidm_value:.4f}",
+                    )
+                else:
+                    train_pbar.set_postfix(
+                        loss=f"{batch_loss_value:.4f}",
+                        ref_loss=f"{batch_loss_ref_value:.4f}",
+                    )
 
-        train_loss = train_loss/len(loader_train)
+        num_train_batches = len(loader_train)
+        if use_ddp:
+            t = torch.tensor([train_loss, num_train_batches], device=device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            train_loss = (t[0] / t[1]).item()
+        else:
+            train_loss = train_loss/num_train_batches
         training_losses[epoch] = train_loss
-        print("loss: "+ str(train_loss))
+        if is_main_process():
+            print("loss: "+ str(train_loss))
 
         val_loss = 0
         model.eval()
-        val_pbar = tqdm(enumerate(loader_val, 0),
-                        unit="batch",
-                        total=len(loader_val))
+        val_iter = enumerate(loader_val, 0)
+        if is_main_process():
+            val_pbar = tqdm(val_iter, unit="batch", total=len(loader_val))
+        else:
+            val_pbar = val_iter
         for i, batch in val_pbar:
             if use_gmm:
-                vdata, vE, vprior = batch
+                if use_pidm:
+                    vdata, vE, vprior, vlayers = batch
+                else:
+                    vdata, vE, vprior = batch
                 vdata = vdata.to(device=device)
                 vE = vE.to(device = device)
                 vprior = vprior.to(device = device)
+                if use_pidm:
+                    vlayers = vlayers.to(device=device)
             else:
-                vE, vdata = batch
+                if use_pidm:
+                    vE, vdata, vlayers = batch
+                else:
+                    vE, vdata = batch
                 vdata = vdata.to(device=device)
                 vE = vE.to(device = device)
+                if use_pidm:
+                    vlayers = vlayers.to(device=device)
 
             noise = torch.randn_like(vdata)
             # Get the actual model (handles DataParallel)
@@ -700,17 +840,27 @@ if __name__ == '__main__':
             if(cold_diffu): noise = actual_model.gen_cold_image(vE, cold_noise_scale, noise)
 
             if use_gmm:
-                # For GMM, check if there's a PIDM version
-                if hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
-                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(vdata, vE, gmm_prior=vprior, noise = noise, energy_loss_scale = energy_loss_scale)
+                if use_pidm and hasattr(actual_model, 'compute_loss_meanflow_gmm_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_gmm_pidm(
+                        vdata, vE, gmm_prior=vprior, noise=noise, energy_loss_scale=energy_loss_scale, layers=vlayers if use_pidm else None
+                    )
                     batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
                 else:
-                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(vdata, vE, gmm_prior=vprior, noise = noise, energy_loss_scale = energy_loss_scale)
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow_gmm(
+                        vdata, vE, gmm_prior=vprior, noise=noise, energy_loss_scale=energy_loss_scale, layers=vlayers if use_pidm else None
+                    )
                     batch_loss = loss_vec.mean()
             else:
-                # Use PIDM version which includes physics constraints
-                loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(vdata, vE, noise = noise, energy_loss_scale = energy_loss_scale)
-                batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                if use_pidm and hasattr(actual_model, 'compute_loss_meanflow_pidm'):
+                    loss_vec, loss_ref, loss_pidm_vec = actual_model.compute_loss_meanflow_pidm(
+                        vdata, vE, noise=noise, energy_loss_scale=energy_loss_scale, layers=vlayers if use_pidm else None
+                    )
+                    batch_loss = loss_vec.mean() + weight_pidm * loss_pidm_vec.mean()
+                else:
+                    loss_vec, loss_ref = actual_model.compute_loss_meanflow(
+                        vdata, vE, noise=noise, energy_loss_scale=energy_loss_scale, layers=vlayers if use_pidm else None
+                    )
+                    batch_loss = loss_vec.mean()
             
             batch_loss_ref = loss_ref.mean()
 
@@ -720,48 +870,64 @@ if __name__ == '__main__':
             
             val_loss += batch_loss_value
             
-            val_pbar.set_postfix(
-                loss=f"{batch_loss_value:.4f}",
-                ref_loss=f"{batch_loss_ref_value:.4f}",
-            )
+            if is_main_process():
+                val_pbar.set_postfix(
+                    loss=f"{batch_loss_value:.4f}",
+                    ref_loss=f"{batch_loss_ref_value:.4f}",
+                )
             
             if use_gmm:
                 del vdata, vE, vprior, noise, batch_loss, batch_loss_ref
+                if use_pidm:
+                    del vlayers
             else:
                 del vdata, vE, noise, batch_loss, batch_loss_ref
+                if use_pidm:
+                    del vlayers
 
-        val_loss = val_loss/len(loader_val)
+        num_val_batches = len(loader_val)
+        if use_ddp:
+            v = torch.tensor([val_loss, num_val_batches], device=device, dtype=torch.float32)
+            dist.all_reduce(v, op=dist.ReduceOp.SUM)
+            val_loss = (v[0] / v[1]).item()
+        else:
+            val_loss = val_loss/num_val_batches
         val_losses[epoch] = val_loss
-        print("val_loss: "+ str(val_loss), flush = True)
+        if is_main_process():
+            print("val_loss: "+ str(val_loss), flush = True)
 
         scheduler.step(torch.tensor([train_loss]))
 
         if(val_loss < min_validation_loss):
-            torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'best_val.pth'))
+            if is_main_process():
+                torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'best_val.pth'))
             min_validation_loss = val_loss
 
         if(early_stopper.early_stop(val_loss - train_loss)):
-            print("Early stopping!")
+            if is_main_process():
+                print("Early stopping!")
             break
 
         # save the model
         model.eval()
-        print("SAVING")
+        if is_main_process():
+            print("SAVING")
         
         #save full training state so can be resumed
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': get_model_state_dict(model),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss_hist': training_losses,
-            'val_loss_hist': val_losses,
-            'early_stop_dict': early_stopper.__dict__,
-            }, checkpoint_path)
+        if is_main_process():
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': get_model_state_dict(model),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss_hist': training_losses,
+                'val_loss_hist': val_losses,
+                'early_stop_dict': early_stopper.__dict__,
+                }, checkpoint_path)
         
         # --- NEW: milestone checkpoints at specific epochs ---
         epoch_1based = epoch + 1
-        if epoch_1based in MILESTONE_EPOCHS:
+        if epoch_1based in MILESTONE_EPOCHS and is_main_process():
             tag = f"epoch_{epoch_1based:03d}"
             print(f"SAVING in {tag}")
             # full state (resume-able)
@@ -775,15 +941,22 @@ if __name__ == '__main__':
                 'early_stop_dict': early_stopper.__dict__,
             }, os.path.join(checkpoint_folder, f"checkpoint_{tag}.pt"))
 
+        if is_main_process():
+            with open(checkpoint_folder + "/training_losses.txt","w") as tfileout:
+                tfileout.write("\n".join("{}".format(tl) for tl in training_losses)+"\n")
+            with open(checkpoint_folder + "/validation_losses.txt","w") as vfileout:
+                vfileout.write("\n".join("{}".format(vl) for vl in val_losses)+"\n")
+
+    if is_main_process():
+        print("Saving to %s" % checkpoint_folder, flush=True)
+        torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'final.pth'))
+
+    if is_main_process():
         with open(checkpoint_folder + "/training_losses.txt","w") as tfileout:
             tfileout.write("\n".join("{}".format(tl) for tl in training_losses)+"\n")
         with open(checkpoint_folder + "/validation_losses.txt","w") as vfileout:
             vfileout.write("\n".join("{}".format(vl) for vl in val_losses)+"\n")
 
-    print("Saving to %s" % checkpoint_folder, flush=True)
-    torch.save(get_model_state_dict(model), os.path.join(checkpoint_folder, 'final.pth'))
-
-    with open(checkpoint_folder + "/training_losses.txt","w") as tfileout:
-        tfileout.write("\n".join("{}".format(tl) for tl in training_losses)+"\n")
-    with open(checkpoint_folder + "/validation_losses.txt","w") as vfileout:
-        vfileout.write("\n".join("{}".format(vl) for vl in val_losses)+"\n")
+    if use_ddp:
+        dist.barrier()
+        dist.destroy_process_group()

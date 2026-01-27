@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Union
 import numpy as np
 import time
@@ -422,8 +423,9 @@ class CaloDiffu(nn.Module):
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
         original_device = z_t.device
         
-        # Only split if we have multiple GPUs and batch is large enough
-        if num_gpus > 1 and batch_size > 32:
+        # Only split if explicitly enabled (multi-GPU jvp can cause device mismatches)
+        enable_multi_gpu_jvp = os.environ.get("MF_JVP_MULTI_GPU", "0") == "1"
+        if enable_multi_gpu_jvp and num_gpus > 1 and batch_size > 4:
             # Split batch across GPUs
             chunk_size = max(batch_size // num_gpus, 1)  # At least 1 per GPU
             
