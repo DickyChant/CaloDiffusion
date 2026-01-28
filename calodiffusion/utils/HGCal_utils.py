@@ -26,9 +26,11 @@ def preprocess_hgcal_shower(
     orig_shape=False,
     ecut=0,
     max_deposit=2,
+    verbose=True,
 ):
 
-    print("dset", dataset_num)
+    if verbose:
+        print("dset", dataset_num)
 
     c = constants.dataset_params[dataset_num]
 
@@ -108,9 +110,11 @@ def DataLoaderHGCal(
     shower_scale=200.0,
     config=None,
     binning_file="",
+    verbose=True,
 ):
 
-    print(file_name)
+    if verbose:
+        print(file_name)
     with h5.File(file_name, "r") as h5f:
         # holdout events for testing
         if nevts == -1 and nholdout > 0:
@@ -121,7 +125,8 @@ def DataLoaderHGCal(
             end = None
         if end == -1:
             end = None
-        print("Event start, stop: ", evt_start, end)
+        if verbose:
+            print("Event start, stop: ", evt_start, end)
         gen_info = h5f["gen_info"][evt_start:end].astype(np.float32)
         shower = (
             h5f["showers"][evt_start:end][:, :, :max_cells].astype(np.float32)
@@ -154,6 +159,7 @@ def DataLoaderHGCal(
         orig_shape=orig_shape,
         ecut=ecut,
         max_deposit=max_deposit,
+        verbose=verbose,
     )
 
     gen_preprocessed = (gen_info - gen_min) / (gen_max - gen_min)

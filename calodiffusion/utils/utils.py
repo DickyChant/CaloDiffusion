@@ -924,9 +924,13 @@ def load_data(args, config, eval=False, NN_embed=None):
                 config=config,
                 embed=pre_embed,
                 NN_embed=NN_embed,
+                verbose=config.get("VERBOSE", False),
             )
             n_showers += showers.shape[0]
 
+            if layers is None:
+                # No layer conditioning in SHOWERMAP; use dummy layerE to keep pipeline consistent.
+                layers = np.zeros((showers.shape[0], 1), dtype=np.float32)
             layers = np.reshape(layers, (layers.shape[0], -1))
 
             if orig_shape:

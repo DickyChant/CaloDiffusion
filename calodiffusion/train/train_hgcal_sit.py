@@ -405,7 +405,22 @@ if __name__ == '__main__':
     avg_showers = std_showers = E_bins = None
     # NN_embed already initialized above if pre_embed is True
 
-    energies = np.reshape(energies,(-1))    
+    energies = np.reshape(energies,(-1))
+
+    # Fallback: if data is still in raw HGCal format (N, layers, cells), preprocess now
+    if (not orig_shape) and dataset_config.get('HGCAL', False) and data.ndim == 3:
+        print("[WARNING] Data appears unprocessed (raw HGCal shape). Applying preprocess_hgcal_shower...", flush=True)
+        data, energies = HGCal_utils.preprocess_hgcal_shower(
+            data,
+            energies,
+            dataset_config['SHAPE_PAD'],
+            dataset_config['SHOWERMAP'],
+            dataset_num=dataset_num,
+            orig_shape=orig_shape,
+            ecut=dataset_config.get('ECUT', 0),
+            max_deposit=dataset_config['MAXDEP'],
+            verbose=dataset_config.get('VERBOSE', False),
+        )
     
     # Check current data shape
     print(f"Data shape before reshape: {data.shape}")
@@ -519,9 +534,12 @@ if __name__ == '__main__':
             checkpoint = torch.load(checkpoint_path, map_location = device)
         print(checkpoint.keys())
 
+    # If data was pre-embedded, avoid re-embedding inside the model
+    NN_embed_for_model = None if pre_embed else NN_embed
+
     if(flags.model == "Diffu"):
         shape = dataset_config['SHAPE_PAD'][1:] if (not orig_shape) else dataset_config['SHAPE_ORIG'][1:]
-        model = CaloDiffu(shape, config=dataset_config, training_obj = training_obj, NN_embed = NN_embed, nsteps = dataset_config['NSTEPS'],
+        model = CaloDiffu(shape, config=dataset_config, training_obj = training_obj, NN_embed = NN_embed_for_model, nsteps = dataset_config['NSTEPS'],
                 cold_diffu = cold_diffu, avg_showers = avg_showers, std_showers = std_showers, E_bins = E_bins ).to(device = device)
 
         #sometimes save only weights, sometimes save other info
@@ -623,17 +641,20 @@ if __name__ == '__main__':
             # Note: SiT usually uses 'uniform' or 'lognormal' weighting, and doesn't return loss_vec/loss_ref
             # It returns a scalar loss
             # We assume training_obj='noise_pred' or 'sit' (doesn't matter as long as we call compute_loss_sit)
-            batch_loss = actual_model.compute_loss_sit(data, E, noise=noise, energy_loss_scale=energy_loss_scale)
-            
-            # Create dummy ref/pidm placeholders since SiT doesn't return them
-            batch_loss_ref = torch.tensor(0.0, device=device)
-            loss_vec = batch_loss
-            loss_ref = batch_loss_ref
+            loss_diff, loss_ref, loss_pidm_vec = actual_model.compute_loss_sit(
+                data, E, noise=noise, energy_loss_scale=energy_loss_scale
+            )
+            weight_pidm = dataset_config.get("WEIGHT_PIDM", 0.0)
+            if loss_pidm_vec is not None and weight_pidm > 0:
+                batch_loss = loss_diff + weight_pidm * loss_pidm_vec.mean()
+            else:
+                batch_loss = loss_diff
+            loss_vec = loss_diff
 
             
             # Save loss value before deleting tensors
             batch_loss_value = batch_loss.item()
-            batch_loss_ref_value = batch_loss_ref.item()
+            batch_loss_ref_value = loss_ref.item() if torch.is_tensor(loss_ref) else 0.0
             loss_pidm_value = loss_pidm_vec.mean().item() if loss_pidm_vec is not None else None
             
             batch_loss.backward()
@@ -698,24 +719,34 @@ if __name__ == '__main__':
             if(cold_diffu): noise = actual_model.gen_cold_image(vE, cold_noise_scale, noise)
 
             # Use SiT loss
-            batch_loss = actual_model.compute_loss_sit(vdata, vE, noise=noise, energy_loss_scale=energy_loss_scale)
-            
-            # Create dummy ref/pidm placeholders
-            batch_loss_ref = torch.tensor(0.0, device=device)
-            loss_vec = batch_loss
-            loss_ref = batch_loss_ref
+            loss_diff, loss_ref, loss_pidm_vec = actual_model.compute_loss_sit(
+                vdata, vE, noise=noise, energy_loss_scale=energy_loss_scale
+            )
+            weight_pidm = dataset_config.get("WEIGHT_PIDM", 0.0)
+            if loss_pidm_vec is not None and weight_pidm > 0:
+                batch_loss = loss_diff + weight_pidm * loss_pidm_vec.mean()
+            else:
+                batch_loss = loss_diff
+            loss_vec = loss_diff
 
 
             # Save loss values before deleting tensors
             batch_loss_value = batch_loss.item()
-            batch_loss_ref_value = batch_loss_ref.item()
+            batch_loss_ref_value = loss_ref.item() if torch.is_tensor(loss_ref) else 0.0
             
             val_loss += batch_loss_value
             
-            val_pbar.set_postfix(
-                loss=f"{batch_loss_value:.4f}",
-                ref_loss=f"{batch_loss_ref_value:.4f}",
-            )
+            if loss_pidm_vec is not None:
+                val_pbar.set_postfix(
+                    loss=f"{batch_loss_value:.4f}",
+                    ref_loss=f"{batch_loss_ref_value:.4f}",
+                    pidm_loss=f"{loss_pidm_vec.mean().item():.4f}",
+                )
+            else:
+                val_pbar.set_postfix(
+                    loss=f"{batch_loss_value:.4f}",
+                    ref_loss=f"{batch_loss_ref_value:.4f}",
+                )
             
             if use_gmm:
                 del vdata, vE, vprior, noise, batch_loss, batch_loss_ref

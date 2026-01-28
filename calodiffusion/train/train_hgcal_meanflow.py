@@ -60,6 +60,7 @@ if __name__ == '__main__':
         print(f"[INFO] GMM will sample prior during training (not loading pre-generated H5)", flush=True)
 
     dataset_config = utils.LoadJson(flags.config)
+    dataset_config.setdefault("VERBOSE", False)
 
     # Override FILES from config if --files is provided
     if flags.files is not None:

@@ -78,10 +78,12 @@ class CaloDiffusion(Diffusion):
             
             # Compute cond_size - use LEGACY_COND_SIZE for backward compatibility with old checkpoints
             if self.config.get("LEGACY_COND_SIZE", False):
-                cond_size = 1  # Old checkpoints used only energy conditioning
+                # Old checkpoints used only energy conditioning; disable layer conditioning
+                cond_size = 1
+                self.layer_cond = False
             else:
                 cond_size = 2 + self.config["SHAPE_FINAL"][2] if "layer" in self.config.get("SHOWERMAP", "") else 1
-                #extra conditioning info for hgcal
+                # extra conditioning info for hgcal
                 if(self.hgcal): cond_size +=2
             calo_summary_shape = [1, in_channels] + list(copy.copy(self.config["SHAPE_FINAL"][1:]))
 
@@ -155,6 +157,10 @@ class CaloDiffusion(Diffusion):
         if (self.layer_cond) and (layers is not None):
             E = torch.cat([E, layers], dim=1)
 
+        # Legacy checkpoints expect energy-only conditioning
+        if self.config.get("LEGACY_COND_SIZE", False) and E is not None:
+            if E.ndim == 2 and E.shape[1] > 1:
+                E = E[:, :1]
         rz_phi = self.add_RZPhi(x).float()
         
         # MeanFlowDiT requires r parameter
@@ -199,14 +205,25 @@ class CaloDiffusion(Diffusion):
             return x
         cats = [x]
         const_shape = (x.shape[0], *((1,) * (len(x.shape) - 1)))
+        target_shape = x.shape[1:]  # (C, L, H, W)
 
         if not self.fully_connected and self.config.get("R_Z_INPUT", False): 
+            # Rebuild R/Z images if cached shapes don't match current input
+            if tuple(self.R_image.shape) != tuple(target_shape):
+                self.R_image, self.Z_image = utils.create_R_Z_image(
+                    self.device,
+                    dataset_num=self.dataset_num,
+                    scaled=True,
+                    shape=target_shape,
+                )
             batch_R_image = self.R_image.repeat(const_shape).to(device=self.device)
             batch_Z_image = self.Z_image.repeat(const_shape).to(device=self.device)
 
             cats += [batch_R_image, batch_Z_image]
 
         if not self.fully_connected and self.config.get("PHI_INPUT", False):
+            if tuple(self.phi_image.shape) != tuple(target_shape):
+                self.phi_image = utils.create_phi_image(self.device, shape=target_shape)
             batch_phi_image = self.phi_image.repeat(const_shape).to(device=self.device)
 
             cats += [batch_phi_image]
@@ -247,6 +264,14 @@ class CaloDiffusion(Diffusion):
             r = sigma.reshape(-1)
 
         scales = self.loss_function.get_scaling(sigma)
+        # Ensure scaling tensors broadcast over spatial dims (sigma is (B,) for MeanFlow)
+        if x.ndim > 1 and scales["c_in"].ndim == 1:
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            scales = {
+                "c_in": scales["c_in"].reshape(shape),
+                "c_skip": scales["c_skip"].reshape(shape),
+                "c_out": scales["c_out"].reshape(shape),
+            }
         pred = self.forward(x * scales['c_in'], E, t_emb, layers=layers, r=r)
 
         if('noise_pred' in loss_function_name):
@@ -1023,10 +1048,104 @@ class CaloDiffu(nn.Module):
         # target (SiT/DDPM-style velocity/score target)
         model_target = d_alpha_t * data + d_sigma_t * noise
         diffusion_loss = mean_flat((model_output - model_target) ** 2).mean()
-        
-     
-            
-        return diffusion_loss
+
+        # Optional PIDM regularizer (consistent with meanflow PIDM path)
+        loss_ref = torch.tensor(0.0, device=device)
+        loss_pidm_vec = None
+        weight_pidm = float(self.config.get("WEIGHT_PIDM", 0.0) or 0.0)
+        if weight_pidm > 0.0:
+            pidm_steps = int(self.config.get("PIDM_SAMPLE_STEPS", 10))
+            pidm_algo = self.config.get("PIDM_SAMPLE_ALGO", "sit")
+            with torch.no_grad():
+                # Use SiT sampler to generate samples for PIDM
+                sample_data, _, _ = self.sit_sampler(
+                    noise, energy, layers=layers, num_steps=pidm_steps, sample_algo=pidm_algo
+                )
+
+            dataset_config = self.config
+            is_hgcal = dataset_config.get("HGCAL", False) or dataset_config.get("DATASET_NUM", 0) == 2
+
+            # Convert to numpy for ReverseNorm
+            real_std_np = data.detach().cpu().numpy()
+            gen_std_np = sample_data.detach().cpu().numpy()
+            E_std_np = energy.detach().cpu().numpy()
+            if E_std_np.ndim == 1:
+                E_std_np = E_std_np.reshape(-1, 1)
+
+            shower_map = dataset_config.get("SHOWERMAP", "")
+            layerE_np = None
+            if layers is not None:
+                layerE_np = layers.detach().cpu().numpy()
+                if layerE_np.ndim == 1:
+                    layerE_np = layerE_np.reshape(-1, 1)
+            elif "layer" in shower_map:
+                batch_size = E_std_np.shape[0]
+                num_layers = 47
+                layerE_np = np.zeros((batch_size, 1 + num_layers))
+                layerE_np[:, 0] = E_std_np[:, 0]
+                layerE_np[:, 1:] = 0.0
+
+            shape_key = dataset_config.get("SHAPE_ORIG") or dataset_config.get("SHAPE") or dataset_config.get("SHAPE_PAD")
+            emin_val = dataset_config["EMIN"]
+            emax_val = dataset_config["EMAX"]
+            if isinstance(emin_val, (list, tuple, np.ndarray)):
+                emin_val = float(emin_val[0]) if len(emin_val) > 0 else float(emin_val)
+            else:
+                emin_val = float(emin_val)
+            if isinstance(emax_val, (list, tuple, np.ndarray)):
+                emax_val = float(emax_val[0]) if len(emax_val) > 0 else float(emax_val)
+            else:
+                emax_val = float(emax_val)
+
+            real_phys, _ = ReverseNorm(
+                real_std_np,
+                E_std_np,
+                hgcal=is_hgcal,
+                layerE=layerE_np,
+                shape=shape_key,
+                logE=dataset_config["logE"],
+                max_deposit=dataset_config["MAXDEP"],
+                emax=emax_val,
+                emin=emin_val,
+                showerMap=dataset_config["SHOWERMAP"],
+                dataset_num=dataset_config["DATASET_NUM"],
+                orig_shape=False,
+                ecut=dataset_config["ECUT"],
+            )
+
+            gen_phys, _ = ReverseNorm(
+                gen_std_np,
+                E_std_np,
+                hgcal=is_hgcal,
+                layerE=layerE_np,
+                shape=shape_key,
+                logE=dataset_config["logE"],
+                max_deposit=dataset_config["MAXDEP"],
+                emax=emax_val,
+                emin=emin_val,
+                showerMap=dataset_config["SHOWERMAP"],
+                dataset_num=dataset_config["DATASET_NUM"],
+                orig_shape=False,
+                ecut=dataset_config["ECUT"],
+            )
+
+            real_phys_tensor = torch.from_numpy(real_phys).to(device=device, dtype=data.dtype)
+            gen_phys_tensor = torch.from_numpy(gen_phys).to(device=device, dtype=data.dtype)
+            if real_phys_tensor.ndim == 4:
+                real_phys_tensor = real_phys_tensor.unsqueeze(1)
+            elif real_phys_tensor.ndim == 2:
+                real_phys_tensor = real_phys_tensor.reshape(data.shape)
+            if gen_phys_tensor.ndim == 4:
+                gen_phys_tensor = gen_phys_tensor.unsqueeze(1)
+            elif gen_phys_tensor.ndim == 2:
+                gen_phys_tensor = gen_phys_tensor.reshape(data.shape)
+
+            S_true = _layer_sums(real_phys_tensor, layer_dim=2)
+            S_sample = _layer_sums(gen_phys_tensor, layer_dim=2)
+            raw_pidm = ((S_sample - S_true.detach()) ** 2).mean(dim=1)
+            loss_pidm_vec = raw_pidm
+
+        return diffusion_loss, loss_ref, loss_pidm_vec
         
     def compute_loss_dino_sit(self, data, energy, zs=None, noise = None, t = None, layers = None, weighting = 'uniform', energy_loss_scale = 1e-2, scales=1):
         self.scales = scales
@@ -2329,7 +2448,16 @@ class CaloDiffu(nn.Module):
         forward_sig = inspect.signature(model_to_use.forward)
         accepts_r = 'r' in forward_sig.parameters
 
-        # your lowhigh path already expects 2 returns from the model
+        # PureDiT does not accept r; use same conditioning style as pred()
+        if self.puredit:
+            out = model_to_use(
+                self.add_RZPhi(x),
+                time=t_emb.reshape(-1,),
+                cond=E.reshape(-1,),
+            )
+            return out
+
+        # CondUnet / MF variants
         # Pass E with shape (batch_size, cond_size), not flattened
         if accepts_r and r_emb is not None:
             out = model_to_use(
@@ -2369,14 +2497,21 @@ class CaloDiffu(nn.Module):
                 )
                 return out_patch, layer2_patch
         else:
-                # -> model returns single patch
-                out_patch = self.model(
+            # -> normal prediction (not patch)
+            if encoder_patch:
+                out, layer2_patch = self.model(
                     self.add_RZPhi(x),
                     time=t_emb.reshape(-1,),
                     cond=E.reshape(-1,),
-                    return_patch=True,
+                    encoder_patch=True,
                 )
-                return out_patch
+                return out, layer2_patch
+            out = self.model(
+                self.add_RZPhi(x),
+                time=t_emb.reshape(-1,),
+                cond=E.reshape(-1,),
+            )
+            return out
 
         # ---- CASE 2: normal diffusion prediction ----
         if self.lowhigh:
