@@ -10,7 +10,12 @@ import torch.utils.data as torchdata
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 import utils
 from HGCal_utils import *
-import jetnet
+try:
+    import jetnet
+    _HAS_JETNET = True
+except Exception:
+    jetnet = None
+    _HAS_JETNET = False
 import h5py
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
@@ -267,7 +272,8 @@ def ttv_split(data1, split=np.array([0.7, 0.2, 0.1])):
 
 def compute_metrics(flags):
 
-    utils.SetStyle()
+    if hasattr(utils, "SetStyle"):
+        utils.SetStyle()
     nevts = int(flags.nevts)
     dataset_config = utils.LoadJson(flags.config)
     emax = dataset_config['EMAX']
@@ -419,17 +425,21 @@ def compute_metrics(flags):
     #FPD KPD
 
     if(flags.fpd):
-        min_samples = min(feats_geant.shape[0], 20000)
-        fpd_val, fpd_err = jetnet.evaluation.fpd(feats_geant, feats_diffu, min_samples = min_samples)
-        kpd_val, kpd_err = jetnet.evaluation.kpd(feats_geant, feats_diffu)
+        if not _HAS_JETNET:
+            print("Warning: jetnet not available; skipping FPD/KPD.", flush=True)
+            flags.fpd = False
+        else:
+            min_samples = min(feats_geant.shape[0], 20000)
+            fpd_val, fpd_err = jetnet.evaluation.fpd(feats_geant, feats_diffu, min_samples = min_samples)
+            kpd_val, kpd_err = jetnet.evaluation.kpd(feats_geant, feats_diffu)
 
-        fpd_result_str = (
-                f"FPD (x10^3): {fpd_val*1e3:.4f} ± {fpd_err*1e3:.4f}\n" 
-                f"KPD (x10^3): {kpd_val*1e3:.4f} ± {kpd_err*1e3:.4f}\n"
-            )
-        print(fpd_result_str)
-        with open(os.path.join(flags.plot_folder, 'metrics.txt'), 'a') as f:
-            f.write(fpd_result_str)
+            fpd_result_str = (
+                    f"FPD (x10^3): {fpd_val*1e3:.4f} ± {fpd_err*1e3:.4f}\n" 
+                    f"KPD (x10^3): {kpd_val*1e3:.4f} ± {kpd_err*1e3:.4f}\n"
+                )
+            print(fpd_result_str)
+            with open(os.path.join(flags.plot_folder, 'metrics.txt'), 'a') as f:
+                f.write(fpd_result_str)
 
     labels_diffu = np.ones((feats_diffu.shape[0], 1), dtype=np.float32)
     labels_geant = np.zeros((feats_geant.shape[0], 1), dtype=np.float32)
