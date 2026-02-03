@@ -1316,7 +1316,9 @@ class CaloDiffu(nn.Module):
     
     
     # fix: r should be always not larger than t
-    def sample_t_r(self, batch_size, device, flow_ratio=0.75):
+    def sample_t_r(self, batch_size, device, flow_ratio=None):
+        if flow_ratio is None:
+            flow_ratio = self.config.get("FLOW_RATIO", 0.75)
         if self.time_dist[0] == 'uniform':
             samples = np.random.rand(batch_size, 2).astype(np.float32)
 
@@ -1339,7 +1341,7 @@ class CaloDiffu(nn.Module):
     
         
         
-    def sample_time_steps(self, batch_size, device, time_sampler='logit_normal'):
+    def sample_time_steps(self, batch_size, device, time_sampler='logit_normal', flow_ratio=None):
         """Sample time steps (r, t) according to the configured sampler"""
         # Step1: Sample two time points
         if time_sampler == "uniform":
@@ -1356,7 +1358,9 @@ class CaloDiffu(nn.Module):
         r, t = sorted_samples[:, 0], sorted_samples[:, 1]
         
         # Step3: Control the proportion of r=t samples
-        fraction_equal = 1.0 - 0.75  # e.g., 0.75 means 75% of samples have r=t
+        if flow_ratio is None:
+            flow_ratio = self.config.get("FLOW_RATIO", 0.75)
+        fraction_equal = flow_ratio  # e.g., 0.75 means 75% of samples have r=t
         # Create a mask for samples where r should equal t
         equal_mask = torch.rand(batch_size, device=device) < fraction_equal
         # Apply the mask: where equal_mask is True, set r=t (replace)
@@ -1382,7 +1386,8 @@ class CaloDiffu(nn.Module):
             
         # Sample time steps
         #r, t = self.sample_time_steps(batch_size, device, time_sampler)
-        r, t = self.sample_t_r(batch_size, device, 0.75)
+        flow_ratio = self.config.get("FLOW_RATIO", 0.75)
+        r, t = self.sample_t_r(batch_size, device, flow_ratio)
         
         t_ = torch.reshape(t, const_shape).detach().clone()
         r_ = torch.reshape(r, const_shape).detach().clone()
@@ -1469,7 +1474,8 @@ class CaloDiffu(nn.Module):
         const_shape = (data.shape[0], *((1,) * (len(data.shape) - 1)))
 
 
-        r, t = self.sample_t_r(batch_size, device, 0.75)
+        flow_ratio = self.config.get("FLOW_RATIO", 0.75)
+        r, t = self.sample_t_r(batch_size, device, flow_ratio)
         
         t_ = torch.reshape(t, const_shape).detach().clone()
         r_ = torch.reshape(r, const_shape).detach().clone()
@@ -1649,7 +1655,8 @@ class CaloDiffu(nn.Module):
         batch_size = data.shape[0]
         const_shape = (data.shape[0], *((1,) * (len(data.shape) - 1)))
 
-        r, t = self.sample_t_r(batch_size, device, 0.75)
+        flow_ratio = self.config.get("FLOW_RATIO", 0.75)
+        r, t = self.sample_t_r(batch_size, device, flow_ratio)
         
         t_ = torch.reshape(t, const_shape).detach().clone()
         r_ = torch.reshape(r, const_shape).detach().clone()
@@ -1721,7 +1728,8 @@ class CaloDiffu(nn.Module):
         batch_size = data.shape[0]
         const_shape = (data.shape[0], *((1,) * (len(data.shape) - 1)))
 
-        r, t = self.sample_t_r(batch_size, device, 0.75)
+        flow_ratio = self.config.get("FLOW_RATIO", 0.75)
+        r, t = self.sample_t_r(batch_size, device, flow_ratio)
         
         t_ = torch.reshape(t, const_shape).detach().clone()
         r_ = torch.reshape(r, const_shape).detach().clone()

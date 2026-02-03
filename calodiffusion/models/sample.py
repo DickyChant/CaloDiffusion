@@ -1209,6 +1209,61 @@ class meanflow_gmm(meanflow):
     def __init__(self, config):
         super().__init__(config)
         self.gmm_prior = config.get('gmm_prior', None)
+        self.gmm_prior_data = None
+        if self.gmm_prior is not None:
+            self._load_gmm_prior(self.gmm_prior, config)
+
+    def _load_gmm_prior(self, prior_source, config):
+        """Load GMM prior samples from an H5 file or tensor."""
+        # Accept a tensor/ndarray directly
+        if torch.is_tensor(prior_source):
+            prior = prior_source.detach().cpu()
+        elif isinstance(prior_source, np.ndarray):
+            prior = torch.from_numpy(prior_source).float().cpu()
+        else:
+            prior_path = str(prior_source)
+            if not os.path.exists(prior_path):
+                raise FileNotFoundError("GMM prior file not found: {}".format(prior_path))
+
+            if prior_path.endswith((".h5", ".hdf5")):
+                import h5py as h5
+                with h5.File(prior_path, "r") as f:
+                    prior = f["showers"][:].astype(np.float32)
+                prior = torch.from_numpy(prior).float().cpu()
+            else:
+                raise ValueError(
+                    "Unsupported GMM prior format: {} (expected .h5/.hdf5 or tensor)".format(prior_path)
+                )
+
+        # Reshape to match expected data shape
+        shape = config.get("SHAPE_PAD") or config.get("SHAPE_FINAL")
+        if shape is not None:
+            expected = tuple(shape[1:])
+            if prior.ndim == 2 and prior.shape[1] == int(np.prod(expected)):
+                prior = prior.reshape(-1, *expected)
+            elif prior.ndim == len(shape) and tuple(prior.shape[1:]) == expected:
+                pass  # already correct
+            else:
+                try:
+                    prior = prior.reshape(-1, *expected)
+                except Exception as e:
+                    raise ValueError(
+                        "Cannot reshape GMM prior from {} to expected {}: {}".format(
+                            tuple(prior.shape), expected, e
+                        )
+                    )
+
+        self.gmm_prior_data = prior
+
+    def _sample_prior(self, batch_size, device, dtype):
+        if self.gmm_prior_data is None:
+            return None
+        num = self.gmm_prior_data.shape[0]
+        if num == 0:
+            raise ValueError("GMM prior is empty; cannot sample.")
+        idx = torch.randint(0, num, (batch_size,), device="cpu")
+        batch = self.gmm_prior_data[idx]
+        return batch.to(device=device, dtype=dtype, non_blocking=True)
     
     @torch.no_grad()
     def __call__(
@@ -1220,7 +1275,9 @@ class meanflow_gmm(meanflow):
         If GMM prior is available, use it as starting point instead of pure noise.
         Otherwise falls back to standard MeanFlow sampling.
         """
-        # GMM prior modifies the starting point, but the ODE integration is the same
-        # The start tensor should already be GMM-sampled if gmm_prior was provided
-        # Just call parent's sampling method
+        # If GMM prior is available, replace the noise start with prior samples
+        if self.gmm_prior_data is not None:
+            start = self._sample_prior(start.shape[0], start.device, start.dtype)
+
+        # ODE integration is identical to standard MeanFlow
         return super().__call__(model, start, energy, layers, num_steps, sample_offset, debug)
