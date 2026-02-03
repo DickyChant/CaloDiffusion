@@ -1,3 +1,4 @@
+import os
 from typing import Literal, Optional
 import copy 
 import numpy as np
@@ -6,6 +7,7 @@ import torch
 from calodiffusion.models.calodiffusion import CaloDiffusion
 from calodiffusion.models.models import ResNet
 from calodiffusion.utils import utils
+import calodiffusion.utils.HGCal_utils as HGCal_utils
 
 class LayerDiffusion(CaloDiffusion):
     """
@@ -54,12 +56,18 @@ class LayerDiffusion(CaloDiffusion):
             return super().compute_loss(data, energy, noise, layers, time, rnd_normal)
 
     def load_layer_model_state(self, strict = True): 
+
         try: 
-            self.config['layer_model']
-        except KeyError:
-            raise KeyError("Something went wrong - Layer model path not found in config")
-        
-        layer_model_state_dict = torch.load(self.config['layer_model'], map_location=self.device, weights_only=False)
+            layer_model_path = self.config['layer_model']
+        except KeyError: 
+            layer_model_path = os.path.join(self.config.get("checkpoint", ""), "checkpoint.pth")
+
+            if os.path.exists(layer_model_path):
+                print("Loading training checkpoint from %s" % layer_model_path, flush=True)
+            else:
+                raise RuntimeError("Could not load layer model from either config or checkpoint path")
+
+        layer_model_state_dict = torch.load(layer_model_path, map_location=self.device, weights_only=False)
         state_dict = layer_model_state_dict if 'model_state_dict' not in layer_model_state_dict else layer_model_state_dict['model_state_dict']
         
         weights_prefixes = set([key.split('.')[0] for key in state_dict.keys()])
@@ -161,7 +169,7 @@ class LayerDiffusion(CaloDiffusion):
         debug: bool = False,
         sample_offset: Optional[int] = 0,
         sparse_decoding: Optional[bool] = False,
-        sparse_per_batch: Optional[int] = None,
+        sparse_per_batch: Optional[bool] = False,
     ):
         """
         Generate samples for a whole dataloader
@@ -171,6 +179,19 @@ class LayerDiffusion(CaloDiffusion):
         shower_embed = self.config.get("SHOWER_EMBED", "")
         orig_shape = "orig" in shower_embed
 
+        trainable = self.config.get("TRAINABLE_EMBED", False)
+        dataset_num = self.config.get("DATASET_NUM", 2)
+
+        if(self.pre_embed):
+            self.NN_embed = HGCal_utils.HGCalConverter(
+                bins=self.config["SHAPE_FINAL"],
+                geom_file=self.config["BIN_FILE"],
+                trainable=trainable,
+                device=utils.get_device(),
+            ).to(device=utils.get_device())
+            self.NN_embed.init(norm=True, dataset_num=dataset_num)
+
+
         generated = []
         data = []
         energies = []
@@ -178,7 +199,6 @@ class LayerDiffusion(CaloDiffusion):
 
         for E, _, d_batch in self.tqdm(data_loader):
             E = E.to(device=self.device)
-            d_batch = d_batch.to(device=self.device)
 
             batch_generated = self.sample(
                 E,
@@ -189,31 +209,49 @@ class LayerDiffusion(CaloDiffusion):
                 return_layers=True
             )
             
-            layers_ = batch_generated['layers']
-
-            if debug:
-                data.append(d_batch.detach().cpu().numpy())
+            layers_ = batch_generated['layers'].detach().cpu().numpy()
 
             E = E.detach().cpu().numpy()
-            energies.append(E)
-            layers.append(layers_.detach().cpu().numpy())
 
             # Plot the histograms of normalized voxels for both the diffusion model and Geant4
             if debug:
-                gen = self._debug_sample_plot(batch_generated, data) # TODO correct batch_generated into the tuple of 'x, xs, x0s'
-                generated.append(gen)
+                gen = self._debug_sample_plot(batch_generated, d_batch) # TODO correct batch_generated into the tuple of 'x, xs, x0s'
             else: 
-                generated.append(batch_generated['x'])
+                gen = batch_generated['x']
+
+            gen, E = utils.ReverseNorm(
+                gen,
+                E,
+                shape=self.config["SHAPE_FINAL"],
+                config = self.config,
+                emax=self.config["EMAX"],
+                emin=self.config["EMIN"],
+                layerE=layers_,
+                logE=self.config["logE"],
+                binning_file=self.config["BIN_FILE"],
+                max_deposit=self.config["MAXDEP"],
+                showerMap=self.config["SHOWERMAP"],
+                dataset_num=dataset_num,
+                orig_shape=orig_shape,
+                ecut=float(self.config["ECUT"]),
+                hgcal=self.hgcal,
+                embed=self.pre_embed,
+                NN_embed=self.NN_embed,
+                sparse_decoding=sparse_decoding,
+            )
+            energies.append(E)
+            generated.append(gen)
+
+            del layers_, d_batch
 
         generated = np.concatenate(generated)
         energies = np.concatenate(energies)
-        layers = np.concatenate(layers)
 
         generated, energies = utils.ReverseNorm(
             generated,
             energies,
             shape=self.config["SHAPE_FINAL"],
-            config = self.config,
+            config=self.config,
             emax=self.config["EMAX"],
             emin=self.config["EMIN"],
             layerE=layers,

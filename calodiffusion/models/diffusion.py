@@ -122,7 +122,7 @@ class Diffusion(torch.nn.Module, ABC):
         debug: bool = False,
         sample_offset: Optional[int] = 0,
         sparse_decoding: Optional[bool] = False,
-        sparse_per_batch: Optional[int] = None,
+        sparse_per_batch: Optional[bool] = False,
     ):
         """
         Generate samples for a whole dataloader
