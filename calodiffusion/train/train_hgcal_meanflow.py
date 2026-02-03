@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from calodiffusion.utils import utils
 from calodiffusion.utils import HGCal_utils
+from calodiffusion.utils.hgcal_dataset import HGCalH5IterableDataset
 from calodiffusion.models.calodiffusion import CaloDiffu
 
 
@@ -34,6 +35,13 @@ if __name__ == '__main__':
 
     def is_main_process():
         return (not use_ddp) or rank == 0
+
+    def _log_cuda_mem(prefix=""):
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
+        print(f"[MEM]{prefix} max_alloc={alloc:.2f}GB max_reserved={reserved:.2f}GB", flush=True)
         
     parser = argparse.ArgumentParser()
     
@@ -51,6 +59,10 @@ if __name__ == '__main__':
                        help='Path to GMM prior H5 file. If provided, enables GMM training mode.')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Checkpoint folder path. If not provided, uses ../models/{CHECKPOINT_NAME}_{model}/')
+    parser.add_argument('--stream_h5', action='store_true', default=False,
+                       help='Stream H5 data instead of loading full arrays into memory')
+    parser.add_argument('--stream_chunk', type=int, default=None,
+                       help='Override STREAM_CHUNK from config when streaming H5')
     flags = parser.parse_args()
 
     # Determine if GMM mode is enabled
@@ -61,6 +73,9 @@ if __name__ == '__main__':
 
     dataset_config = utils.LoadJson(flags.config)
     dataset_config.setdefault("VERBOSE", False)
+    stream_h5 = dataset_config.get("STREAM_H5", False) or flags.stream_h5
+    if stream_h5 and use_gmm:
+        raise NotImplementedError("STREAM_H5 does not support GMM prior training.")
 
     # Override FILES from config if --files is provided
     if flags.files is not None:
@@ -133,265 +148,320 @@ if __name__ == '__main__':
     gmm_std = None
     detected_voxel_shape = None  # Will be set after first data load
 
-    data = []
-    energies = []
-    layers = [] if use_pidm else None
-    prior = [] if use_gmm else None
-    
-    # Determine expected raw spatial size for GMM prior conversion
-    # IMPORTANT: Use MAX_CELLS from config, not the actual data file size,
-    # because the embedding layer was initialized with MAX_CELLS
-    expected_raw_spatial_size = None
-    if use_gmm:
-        # Use MAX_CELLS from config (this is what the embedding expects)
-        expected_raw_spatial_size = dataset_config.get('MAX_CELLS', None)
-        if expected_raw_spatial_size is None:
-            # Fall back to SHAPE_ORIG if MAX_CELLS not set
-            expected_raw_spatial_size = dataset_config.get('SHAPE_ORIG', [None, None, None])[2]
-        
-        if expected_raw_spatial_size is None:
-            # Last resort: peek at data file
-            first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
-            if os.path.exists(first_data_file):
-                with h5.File(first_data_file, "r") as h5f_data:
-                    raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
-                    if raw_data_sample.ndim >= 3:
-                        expected_raw_spatial_size = raw_data_sample.shape[2]
-                        print(f"[WARNING] MAX_CELLS not in config, detected from data file: {expected_raw_spatial_size}", flush=True)
-        
-        if is_main_process():
-            print(f"[INFO] Using MAX_CELLS from config for embedding: {expected_raw_spatial_size}", flush=True)
 
-    for i, dataset in enumerate(dataset_config['FILES']):
-        # Load data
-        data_, gen_info_, layers_ = utils.DataLoader(
-                os.path.join(flags.data_folder,dataset),
-                hgcal=True,  # Use HGCal loader
-                shape=dataset_config['SHAPE_PAD'],
-                emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
-                nevts = flags.nevts,
-                max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
-                logE=dataset_config['logE'],
-                showerMap = dataset_config['SHOWERMAP'],
-                nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
-                dataset_num  = dataset_num,
-                orig_shape = orig_shape,
-            embed=pre_embed,
-            NN_embed=NN_embed,
-            config=dataset_config,
-            binning_file=geom_file,
-            shower_scale=shower_scale,
-            max_cells=max_cells,
-        )
-        # Extract energy from gen_info (first column)
-        e_ = gen_info_[:, 0] if gen_info_.ndim > 1 else gen_info_
-        
-        # Sample from GMM prior if needed (instead of loading pre-generated H5)
-        if use_gmm:
-            # Detect voxel shape from first data batch
-            if detected_voxel_shape is None:
-                # Peek at raw data to detect format
-                first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
-                with h5.File(first_data_file, "r") as h5f_data:
-                    raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
-                    if raw_data_sample.ndim == 3:
-                        detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2])  # (layers, spatial_size)
-                    elif raw_data_sample.ndim == 4:
-                        detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2], raw_data_sample.shape[3])  # (layers, H, W)
-                    else:
-                        raise ValueError(f"Unexpected raw data shape: {raw_data_sample.shape}")
-                if is_main_process():
-                    print(f"[INFO] Detected voxel shape: {detected_voxel_shape}", flush=True)
-            
-            # Initialize GMM model once
-            if gmm_model is None:
-                from calodiffusion.train.gmm_hgcal import OriginalMDNConditionalGMM
-                from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
-                
-                gmm_ckpt_path = flags.gmm_prior  # Checkpoint path
-                if not os.path.exists(gmm_ckpt_path):
-                    raise FileNotFoundError(f"GMM checkpoint not found: {gmm_ckpt_path}")
-                
-                # Check if file is actually a checkpoint (should be .pt file)
-                if not gmm_ckpt_path.endswith('.pt'):
-                    raise ValueError(
-                        f"GMM checkpoint path should be a .pt file, got: {gmm_ckpt_path}\n"
-                        f"Note: You should pass the GMM checkpoint path (e.g., gmm_prior_checkpoint.pt), "
-                        f"not the H5 prior file. The code will sample from the checkpoint on-the-fly."
-                    )
-                
-                if is_main_process():
-                    print(f"[INFO] Loading GMM checkpoint from: {gmm_ckpt_path}", flush=True)
-                try:
-                    # Load checkpoint (weights_only=False because checkpoint contains model state, mean, std, etc.)
-                    ckpt = torch.load(gmm_ckpt_path, map_location=device, weights_only=False)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Failed to load GMM checkpoint from {gmm_ckpt_path}.\n"
-                        f"Error: {e}\n"
-                        f"The file may be corrupted or not a valid PyTorch checkpoint.\n"
-                        f"Please verify the checkpoint file or retrain the GMM model."
-                    ) from e
-                
-                # Verify checkpoint has required keys
-                required_keys = ['model_state', 'cond_dim', 'data_dim', 'K', 'hidden', 'mean', 'std']
-                missing_keys = [k for k in required_keys if k not in ckpt]
-                if missing_keys:
-                    raise ValueError(
-                        f"GMM checkpoint is missing required keys: {missing_keys}\n"
-                        f"Found keys: {list(ckpt.keys())}\n"
-                        f"The checkpoint may be from an older version. Please retrain the GMM model."
-                    )
-                
-                # Get data_dim from checkpoint (should match what GMM was trained on)
-                data_dim = ckpt.get('data_dim', None)
-                if data_dim is None:
-                    # Calculate from detected shape as fallback
-                    if len(detected_voxel_shape) == 2:
-                        data_dim = detected_voxel_shape[0] * detected_voxel_shape[1]
-                    elif len(detected_voxel_shape) == 3:
-                        data_dim = np.prod(detected_voxel_shape)
-                    else:
-                        raise ValueError(f"Cannot determine data_dim")
-                
-                gmm_model = OriginalMDNConditionalGMM(
-                    cond_dim=ckpt['cond_dim'],
-                    data_dim=data_dim,
-                    K=ckpt['K'],
-                    hidden=ckpt['hidden']
-                ).to(device)
-                gmm_model.load_state_dict(ckpt["model_state"])
-                gmm_model.eval()
-                gmm_mean = ckpt['mean']
-                gmm_std = ckpt['std']
-                if is_main_process():
-                    print(f"[INFO] Loaded GMM model from checkpoint: {gmm_ckpt_path}", flush=True)
-                    print(f"[INFO] GMM: cond_dim={ckpt['cond_dim']}, data_dim={data_dim}, K={ckpt['K']}, hidden={ckpt['hidden']}", flush=True)
-            
-            # Sample from GMM using the same energies as data
-            n_events = data_.shape[0]
-            e_prior = e_[:n_events] if len(e_) >= n_events else e_
-            
-            # Convert energies to log-space for GMM conditioning (same as GMM training)
-            E_min, E_max = 1.0, 1000.0  # Same as in gmm_hgcal.py
-            e_prior_GeV = e_prior / 1000.0  # Convert to GeV if needed
-            cE = (np.log10(np.clip(e_prior_GeV, E_min, E_max)) - np.log10(E_min)) / (np.log10(E_max) - np.log10(E_min))
-            cE = np.clip(cE, 0.0, 1.0).astype(np.float32)
-            cE_tensor = torch.from_numpy(cE).view(-1, 1).to(device)
-            
-            # Sample from GMM in batches
-            batch_size_gmm = 512
-            samples_list = []
-            with torch.no_grad():
-                for j in range(0, len(cE_tensor), batch_size_gmm):
-                    c_chunk = cE_tensor[j:j+batch_size_gmm]
-                    # Sample from GMM (no anchor needed for pure sampling)
-                    s_chunk = gmm_model.sample_pure(
-                        c_chunk,
-                        n_per_cond=1,
-                        x_anchor=None,
-                        lam=0.0,  # No tethering during training
-                        sigma=0.001,
-                    )  # (B, data_dim) on device
-                    samples_list.append(s_chunk.cpu())
-            
-            prior_flat = torch.cat(samples_list, dim=0).numpy()  # (N, data_dim)
-            
-            # Reshape to match detected voxel shape
-            if len(detected_voxel_shape) == 2:
-                prior_raw = prior_flat.reshape(n_events, detected_voxel_shape[0], detected_voxel_shape[1])
-            elif len(detected_voxel_shape) == 3:
-                prior_raw = prior_flat.reshape(n_events, *detected_voxel_shape)
+    avg_showers = std_showers = E_bins = None
+    if stream_h5 and is_main_process():
+        print("[STREAM] Enabled H5 streaming dataloader", flush=True)
+
+    if stream_h5:
+        train_files = list(dataset_config.get('FILES', []))
+        val_files = list(dataset_config.get('VAL_FILES', [])) or list(dataset_config.get('EVAL', []))
+        if not val_files:
+            if len(train_files) < 2:
+                val_files = list(train_files)
             else:
-                raise ValueError(f"Cannot reshape prior to detected_voxel_shape: {detected_voxel_shape}")
-            
-            # Convert from standardized logit-space to physical
-            from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
-            prior_raw = invert_to_physical_logit(
-                torch.from_numpy(prior_flat).view(n_events, -1),
-                e_prior_GeV * 1000.0,  # Back to original units
-                gmm_mean,
-                gmm_std,
-                detected_voxel_shape
-            ).numpy()
-            
-            # Apply shower_scale if needed
-            prior_raw = prior_raw * shower_scale
-            
+                n_train_files = int(round(flags.frac * len(train_files)))
+                n_train_files = max(1, min(len(train_files) - 1, n_train_files))
+                val_files = train_files[n_train_files:]
+                train_files = train_files[:n_train_files]
+        if not train_files:
+            raise ValueError("STREAM_H5 enabled but FILES list is empty.")
+        if not val_files:
+            raise ValueError("STREAM_H5 enabled but validation file list is empty.")
+        if is_main_process():
+            print(f"[STREAM] Train files: {len(train_files)} | Val files: {len(val_files)}", flush=True)
+
+        stream_chunk = flags.stream_chunk if flags.stream_chunk is not None else dataset_config.get("STREAM_CHUNK", 256)
+        stream_embed_batch = dataset_config.get("STREAM_EMBED_BATCH", stream_chunk)
+        stream_num_workers = int(dataset_config.get("STREAM_NUM_WORKERS", 0))
+        stream_shuffle_samples = dataset_config.get("STREAM_SHUFFLE_SAMPLES", False)
+        stream_shuffle_files = dataset_config.get("STREAM_SHUFFLE_FILES", True)
+
+        if pre_embed and stream_num_workers > 0:
             if is_main_process():
-                print(f"Prior raw shape: {prior_raw.shape}", flush=True)
-                print(f"Data shape after embedding: {data_.shape}", flush=True)
-            
-            # Check if prior is already in embedded format (matches data shape)
-            expected_embedded_shape = data_.shape[1:] if data_.ndim > 1 else None
-            prior_already_embedded = (prior_raw.ndim == len(data_.shape) and 
-                                     prior_raw.shape[1:] == data_.shape[1:])
-            
-            # Process prior through same pipeline as data
-            # Get energies for preprocessing (use same as data)
-            e_prior = e_[:n_events] if len(e_) >= n_events else e_
-            
-            if prior_already_embedded:
-                # Prior is already in embedded format, just preprocess
-                if is_main_process():
-                    print("Prior is already in embedded format, skipping embedding", flush=True)
-                prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
-                    prior_raw,
-                    e_prior,
-                    dataset_config['SHAPE_PAD'],
-                    dataset_config['SHOWERMAP'],
-                    dataset_num=dataset_num,
-                    orig_shape=orig_shape,
-                    ecut=dataset_config.get('ECUT', 0),
-                    max_deposit=dataset_config['MAXDEP'],
-                )
-            elif pre_embed and NN_embed is not None:
-                # Prior needs to go through embedding
-                # Check if prior is in (N, layers, spatial_2d) format - need to flatten to (N, layers, spatial_1d)
-                if prior_raw.ndim == 4 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
-                    # Prior is in (N, 47, H, W) format - flatten spatial dimensions to (N, 47, H*W)
-                    if is_main_process():
-                        print(f"Reshaping prior from {prior_raw.shape} to raw format for embedding", flush=True)
-                    n_events_prior, n_layers, h, w = prior_raw.shape
-                    prior_raw = prior_raw.reshape(n_events_prior, n_layers, h * w)
-                    if is_main_process():
-                        print(f"Prior reshaped to: {prior_raw.shape}", flush=True)
-                
-                # Check if prior has compatible shape for embedding (N, 47, spatial_size)
-                if prior_raw.ndim == 3 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
-                    # Use the detected expected spatial size (from actual data or config)
-                    expected_spatial_size = expected_raw_spatial_size
-                    actual_spatial_size = prior_raw.shape[2]
-                    
-                    # Intelligently handle size mismatch using actual input data size
-                    if actual_spatial_size != expected_spatial_size:
-                        if is_main_process():
-                            print(f"[INFO] Prior spatial size mismatch: {actual_spatial_size} vs expected {expected_spatial_size}", flush=True)
-                            print(f"[INFO] Intelligently converting prior to match actual data format...", flush=True)
-                        
-                        # Smart conversion: pad with zeros if smaller, crop if larger
-                        # This preserves the existing data and pads/crops appropriately
-                        if actual_spatial_size < expected_spatial_size:
-                            # Pad with zeros at the end (low-energy cells typically at the end)
-                            pad_size = expected_spatial_size - actual_spatial_size
-                            prior_raw = np.pad(prior_raw, ((0, 0), (0, 0), (0, pad_size)), 
-                                             mode='constant', constant_values=0)
-                            print(f"[INFO] Padded prior from {actual_spatial_size} to {expected_spatial_size} cells (added {pad_size} zero cells)", flush=True)
+                print("[STREAM] pre_embed active; forcing STREAM_NUM_WORKERS=0", flush=True)
+            stream_num_workers = 0
+
+        # Avoid batch_size=1 for PIDM + layer maps (ReverseNormHGCal squeezes batch dim)
+        drop_last = use_pidm and ("layer" in dataset_config.get("SHOWERMAP", ""))
+
+        train_dataset = HGCalH5IterableDataset(
+            files=train_files,
+            data_folder=flags.data_folder,
+            config=dataset_config,
+            shape_pad=dataset_config['SHAPE_PAD'],
+            emax=dataset_config['EMAX'],
+            emin=dataset_config['EMIN'],
+            max_deposit=dataset_config['MAXDEP'],
+            shower_map=dataset_config['SHOWERMAP'],
+            dataset_num=dataset_num,
+            orig_shape=orig_shape,
+            ecut=dataset_config.get('ECUT', 0),
+            nevts=flags.nevts,
+            max_cells=max_cells,
+            shower_scale=shower_scale,
+            pre_embed=pre_embed,
+            NN_embed=NN_embed,
+            use_pidm=use_pidm,
+            chunk_size=stream_chunk,
+            embed_batch_size=stream_embed_batch,
+            shuffle_files=stream_shuffle_files,
+            shuffle_samples=stream_shuffle_samples,
+            seed=flags.seed,
+            rank=rank if use_ddp else 0,
+            world_size=world_size if use_ddp else 1,
+            verbose=dataset_config.get("VERBOSE", False) and is_main_process(),
+        )
+        val_dataset = HGCalH5IterableDataset(
+            files=val_files,
+            data_folder=flags.data_folder,
+            config=dataset_config,
+            shape_pad=dataset_config['SHAPE_PAD'],
+            emax=dataset_config['EMAX'],
+            emin=dataset_config['EMIN'],
+            max_deposit=dataset_config['MAXDEP'],
+            shower_map=dataset_config['SHOWERMAP'],
+            dataset_num=dataset_num,
+            orig_shape=orig_shape,
+            ecut=dataset_config.get('ECUT', 0),
+            nevts=flags.nevts,
+            max_cells=max_cells,
+            shower_scale=shower_scale,
+            pre_embed=pre_embed,
+            NN_embed=NN_embed,
+            use_pidm=use_pidm,
+            chunk_size=stream_chunk,
+            embed_batch_size=stream_embed_batch,
+            shuffle_files=False,
+            shuffle_samples=False,
+            seed=flags.seed + 1,
+            rank=rank if use_ddp else 0,
+            world_size=world_size if use_ddp else 1,
+            verbose=False,
+        )
+
+        train_sampler = None
+        val_sampler = None
+        loader_train = torchdata.DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=stream_num_workers,
+            drop_last=drop_last,
+        )
+        loader_val = torchdata.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=stream_num_workers,
+            drop_last=drop_last,
+        )
+
+    if not stream_h5:
+        data = []
+        energies = []
+        layers = [] if use_pidm else None
+        prior = [] if use_gmm else None
+    
+        # Determine expected raw spatial size for GMM prior conversion
+        # IMPORTANT: Use MAX_CELLS from config, not the actual data file size,
+        # because the embedding layer was initialized with MAX_CELLS
+        expected_raw_spatial_size = None
+        if use_gmm:
+            # Use MAX_CELLS from config (this is what the embedding expects)
+            expected_raw_spatial_size = dataset_config.get('MAX_CELLS', None)
+            if expected_raw_spatial_size is None:
+                # Fall back to SHAPE_ORIG if MAX_CELLS not set
+                expected_raw_spatial_size = dataset_config.get('SHAPE_ORIG', [None, None, None])[2]
+        
+            if expected_raw_spatial_size is None:
+                # Last resort: peek at data file
+                first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
+                if os.path.exists(first_data_file):
+                    with h5.File(first_data_file, "r") as h5f_data:
+                        raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
+                        if raw_data_sample.ndim >= 3:
+                            expected_raw_spatial_size = raw_data_sample.shape[2]
+                            print(f"[WARNING] MAX_CELLS not in config, detected from data file: {expected_raw_spatial_size}", flush=True)
+        
+            if is_main_process():
+                print(f"[INFO] Using MAX_CELLS from config for embedding: {expected_raw_spatial_size}", flush=True)
+
+        for i, dataset in enumerate(dataset_config['FILES']):
+            # Load data
+            data_, gen_info_, layers_ = utils.DataLoader(
+                    os.path.join(flags.data_folder,dataset),
+                    hgcal=True,  # Use HGCal loader
+                    shape=dataset_config['SHAPE_PAD'],
+                    emax = dataset_config['EMAX'],emin = dataset_config['EMIN'],
+                    nevts = flags.nevts,
+                    max_deposit=dataset_config['MAXDEP'], #noise can generate more deposited energy than generated
+                    logE=dataset_config['logE'],
+                    showerMap = dataset_config['SHOWERMAP'],
+                    nholdout = nholdout if (i == len(dataset_config['FILES']) -1 ) else 0,
+                    dataset_num  = dataset_num,
+                    orig_shape = orig_shape,
+                embed=pre_embed,
+                NN_embed=NN_embed,
+                config=dataset_config,
+                binning_file=geom_file,
+                shower_scale=shower_scale,
+                max_cells=max_cells,
+            )
+            # Extract energy from gen_info (first column)
+            e_ = gen_info_[:, 0] if gen_info_.ndim > 1 else gen_info_
+        
+            # Sample from GMM prior if needed (instead of loading pre-generated H5)
+            if use_gmm:
+                # Detect voxel shape from first data batch
+                if detected_voxel_shape is None:
+                    # Peek at raw data to detect format
+                    first_data_file = os.path.join(flags.data_folder, dataset_config['FILES'][0])
+                    with h5.File(first_data_file, "r") as h5f_data:
+                        raw_data_sample = h5f_data["showers"][:1].astype(np.float32)
+                        if raw_data_sample.ndim == 3:
+                            detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2])  # (layers, spatial_size)
+                        elif raw_data_sample.ndim == 4:
+                            detected_voxel_shape = (raw_data_sample.shape[1], raw_data_sample.shape[2], raw_data_sample.shape[3])  # (layers, H, W)
                         else:
-                            # Crop to expected size (keep the first cells, which are typically higher energy)
-                            prior_raw = prior_raw[:, :, :expected_spatial_size]
-                            print(f"[INFO] Cropped prior from {actual_spatial_size} to {expected_spatial_size} cells (removed {actual_spatial_size - expected_spatial_size} cells)", flush=True)
-                        
-                        print(f"[NOTE] For best results, regenerate GMM prior with spatial size matching your data ({expected_spatial_size} cells)", flush=True)
-                    
-                    # Prior now has correct shape, apply embedding
-                    print(f"Applying embedding to prior: {prior_raw.shape} -> embedded", flush=True)
-                    # Convert numpy array to torch tensor and apply embedding
-                    # enc_batches already returns numpy array (does .cpu().numpy() internally)
-                    prior_embedded = NN_embed.enc_batches(torch.Tensor(prior_raw))
-                    # Preprocess after embedding
+                            raise ValueError(f"Unexpected raw data shape: {raw_data_sample.shape}")
+                    if is_main_process():
+                        print(f"[INFO] Detected voxel shape: {detected_voxel_shape}", flush=True)
+            
+                # Initialize GMM model once
+                if gmm_model is None:
+                    from calodiffusion.train.gmm_hgcal import OriginalMDNConditionalGMM
+                    from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
+                
+                    gmm_ckpt_path = flags.gmm_prior  # Checkpoint path
+                    if not os.path.exists(gmm_ckpt_path):
+                        raise FileNotFoundError(f"GMM checkpoint not found: {gmm_ckpt_path}")
+                
+                    # Check if file is actually a checkpoint (should be .pt file)
+                    if not gmm_ckpt_path.endswith('.pt'):
+                        raise ValueError(
+                            f"GMM checkpoint path should be a .pt file, got: {gmm_ckpt_path}\n"
+                            f"Note: You should pass the GMM checkpoint path (e.g., gmm_prior_checkpoint.pt), "
+                            f"not the H5 prior file. The code will sample from the checkpoint on-the-fly."
+                        )
+                
+                    if is_main_process():
+                        print(f"[INFO] Loading GMM checkpoint from: {gmm_ckpt_path}", flush=True)
+                    try:
+                        # Load checkpoint (weights_only=False because checkpoint contains model state, mean, std, etc.)
+                        ckpt = torch.load(gmm_ckpt_path, map_location=device, weights_only=False)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Failed to load GMM checkpoint from {gmm_ckpt_path}.\n"
+                            f"Error: {e}\n"
+                            f"The file may be corrupted or not a valid PyTorch checkpoint.\n"
+                            f"Please verify the checkpoint file or retrain the GMM model."
+                        ) from e
+                
+                    # Verify checkpoint has required keys
+                    required_keys = ['model_state', 'cond_dim', 'data_dim', 'K', 'hidden', 'mean', 'std']
+                    missing_keys = [k for k in required_keys if k not in ckpt]
+                    if missing_keys:
+                        raise ValueError(
+                            f"GMM checkpoint is missing required keys: {missing_keys}\n"
+                            f"Found keys: {list(ckpt.keys())}\n"
+                            f"The checkpoint may be from an older version. Please retrain the GMM model."
+                        )
+                
+                    # Get data_dim from checkpoint (should match what GMM was trained on)
+                    data_dim = ckpt.get('data_dim', None)
+                    if data_dim is None:
+                        # Calculate from detected shape as fallback
+                        if len(detected_voxel_shape) == 2:
+                            data_dim = detected_voxel_shape[0] * detected_voxel_shape[1]
+                        elif len(detected_voxel_shape) == 3:
+                            data_dim = np.prod(detected_voxel_shape)
+                        else:
+                            raise ValueError(f"Cannot determine data_dim")
+                
+                    gmm_model = OriginalMDNConditionalGMM(
+                        cond_dim=ckpt['cond_dim'],
+                        data_dim=data_dim,
+                        K=ckpt['K'],
+                        hidden=ckpt['hidden']
+                    ).to(device)
+                    gmm_model.load_state_dict(ckpt["model_state"])
+                    gmm_model.eval()
+                    gmm_mean = ckpt['mean']
+                    gmm_std = ckpt['std']
+                    if is_main_process():
+                        print(f"[INFO] Loaded GMM model from checkpoint: {gmm_ckpt_path}", flush=True)
+                        print(f"[INFO] GMM: cond_dim={ckpt['cond_dim']}, data_dim={data_dim}, K={ckpt['K']}, hidden={ckpt['hidden']}", flush=True)
+            
+                # Sample from GMM using the same energies as data
+                n_events = data_.shape[0]
+                e_prior = e_[:n_events] if len(e_) >= n_events else e_
+            
+                # Convert energies to log-space for GMM conditioning (same as GMM training)
+                E_min, E_max = 1.0, 1000.0  # Same as in gmm_hgcal.py
+                e_prior_GeV = e_prior / 1000.0  # Convert to GeV if needed
+                cE = (np.log10(np.clip(e_prior_GeV, E_min, E_max)) - np.log10(E_min)) / (np.log10(E_max) - np.log10(E_min))
+                cE = np.clip(cE, 0.0, 1.0).astype(np.float32)
+                cE_tensor = torch.from_numpy(cE).view(-1, 1).to(device)
+            
+                # Sample from GMM in batches
+                batch_size_gmm = 512
+                samples_list = []
+                with torch.no_grad():
+                    for j in range(0, len(cE_tensor), batch_size_gmm):
+                        c_chunk = cE_tensor[j:j+batch_size_gmm]
+                        # Sample from GMM (no anchor needed for pure sampling)
+                        s_chunk = gmm_model.sample_pure(
+                            c_chunk,
+                            n_per_cond=1,
+                            x_anchor=None,
+                            lam=0.0,  # No tethering during training
+                            sigma=0.001,
+                        )  # (B, data_dim) on device
+                        samples_list.append(s_chunk.cpu())
+            
+                prior_flat = torch.cat(samples_list, dim=0).numpy()  # (N, data_dim)
+            
+                # Reshape to match detected voxel shape
+                if len(detected_voxel_shape) == 2:
+                    prior_raw = prior_flat.reshape(n_events, detected_voxel_shape[0], detected_voxel_shape[1])
+                elif len(detected_voxel_shape) == 3:
+                    prior_raw = prior_flat.reshape(n_events, *detected_voxel_shape)
+                else:
+                    raise ValueError(f"Cannot reshape prior to detected_voxel_shape: {detected_voxel_shape}")
+            
+                # Convert from standardized logit-space to physical
+                from calodiffusion.train.gmm_hgcal import invert_to_physical_logit
+                prior_raw = invert_to_physical_logit(
+                    torch.from_numpy(prior_flat).view(n_events, -1),
+                    e_prior_GeV * 1000.0,  # Back to original units
+                    gmm_mean,
+                    gmm_std,
+                    detected_voxel_shape
+                ).numpy()
+            
+                # Apply shower_scale if needed
+                prior_raw = prior_raw * shower_scale
+            
+                if is_main_process():
+                    print(f"Prior raw shape: {prior_raw.shape}", flush=True)
+                    print(f"Data shape after embedding: {data_.shape}", flush=True)
+            
+                # Check if prior is already in embedded format (matches data shape)
+                expected_embedded_shape = data_.shape[1:] if data_.ndim > 1 else None
+                prior_already_embedded = (prior_raw.ndim == len(data_.shape) and 
+                                         prior_raw.shape[1:] == data_.shape[1:])
+            
+                # Process prior through same pipeline as data
+                # Get energies for preprocessing (use same as data)
+                e_prior = e_[:n_events] if len(e_) >= n_events else e_
+            
+                if prior_already_embedded:
+                    # Prior is already in embedded format, just preprocess
+                    if is_main_process():
+                        print("Prior is already in embedded format, skipping embedding", flush=True)
                     prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
-                        prior_embedded,
+                        prior_raw,
                         e_prior,
                         dataset_config['SHAPE_PAD'],
                         dataset_config['SHOWERMAP'],
@@ -400,188 +470,244 @@ if __name__ == '__main__':
                         ecut=dataset_config.get('ECUT', 0),
                         max_deposit=dataset_config['MAXDEP'],
                     )
+                elif pre_embed and NN_embed is not None:
+                    # Prior needs to go through embedding
+                    # Check if prior is in (N, layers, spatial_2d) format - need to flatten to (N, layers, spatial_1d)
+                    if prior_raw.ndim == 4 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
+                        # Prior is in (N, 47, H, W) format - flatten spatial dimensions to (N, 47, H*W)
+                        if is_main_process():
+                            print(f"Reshaping prior from {prior_raw.shape} to raw format for embedding", flush=True)
+                        n_events_prior, n_layers, h, w = prior_raw.shape
+                        prior_raw = prior_raw.reshape(n_events_prior, n_layers, h * w)
+                        if is_main_process():
+                            print(f"Prior reshaped to: {prior_raw.shape}", flush=True)
+                
+                    # Check if prior has compatible shape for embedding (N, 47, spatial_size)
+                    if prior_raw.ndim == 3 and prior_raw.shape[1] == dataset_config['SHAPE_ORIG'][1]:
+                        # Use the detected expected spatial size (from actual data or config)
+                        expected_spatial_size = expected_raw_spatial_size
+                        actual_spatial_size = prior_raw.shape[2]
+                    
+                        # Intelligently handle size mismatch using actual input data size
+                        if actual_spatial_size != expected_spatial_size:
+                            if is_main_process():
+                                print(f"[INFO] Prior spatial size mismatch: {actual_spatial_size} vs expected {expected_spatial_size}", flush=True)
+                                print(f"[INFO] Intelligently converting prior to match actual data format...", flush=True)
+                        
+                            # Smart conversion: pad with zeros if smaller, crop if larger
+                            # This preserves the existing data and pads/crops appropriately
+                            if actual_spatial_size < expected_spatial_size:
+                                # Pad with zeros at the end (low-energy cells typically at the end)
+                                pad_size = expected_spatial_size - actual_spatial_size
+                                prior_raw = np.pad(prior_raw, ((0, 0), (0, 0), (0, pad_size)), 
+                                                 mode='constant', constant_values=0)
+                                print(f"[INFO] Padded prior from {actual_spatial_size} to {expected_spatial_size} cells (added {pad_size} zero cells)", flush=True)
+                            else:
+                                # Crop to expected size (keep the first cells, which are typically higher energy)
+                                prior_raw = prior_raw[:, :, :expected_spatial_size]
+                                print(f"[INFO] Cropped prior from {actual_spatial_size} to {expected_spatial_size} cells (removed {actual_spatial_size - expected_spatial_size} cells)", flush=True)
+                        
+                            print(f"[NOTE] For best results, regenerate GMM prior with spatial size matching your data ({expected_spatial_size} cells)", flush=True)
+                    
+                        # Prior now has correct shape, apply embedding
+                        print(f"Applying embedding to prior: {prior_raw.shape} -> embedded", flush=True)
+                        # Convert numpy array to torch tensor and apply embedding
+                        # enc_batches already returns numpy array (does .cpu().numpy() internally)
+                        prior_embedded = NN_embed.enc_batches(torch.Tensor(prior_raw))
+                        # Preprocess after embedding
+                        prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                            prior_embedded,
+                            e_prior,
+                            dataset_config['SHAPE_PAD'],
+                            dataset_config['SHOWERMAP'],
+                            dataset_num=dataset_num,
+                            orig_shape=orig_shape,
+                            ecut=dataset_config.get('ECUT', 0),
+                            max_deposit=dataset_config['MAXDEP'],
+                        )
+                    else:
+                        # Prior shape doesn't match - might be from different geometry
+                        raise ValueError(
+                            f"Prior shape {prior_raw.shape} is incompatible. "
+                            f"Expected either embedded shape {expected_embedded_shape} or "
+                            f"raw shape (N, {dataset_config['SHAPE_ORIG'][1]}, {dataset_config.get('MAX_CELLS', 'spatial_size')}). "
+                            f"Prior may be from a different geometry configuration."
+                        )
                 else:
-                    # Prior shape doesn't match - might be from different geometry
-                    raise ValueError(
-                        f"Prior shape {prior_raw.shape} is incompatible. "
-                        f"Expected either embedded shape {expected_embedded_shape} or "
-                        f"raw shape (N, {dataset_config['SHAPE_ORIG'][1]}, {dataset_config.get('MAX_CELLS', 'spatial_size')}). "
-                        f"Prior may be from a different geometry configuration."
+                    # No embedding, preprocess directly
+                    prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
+                        prior_raw,
+                        e_prior,
+                        dataset_config['SHAPE_PAD'],
+                        dataset_config['SHOWERMAP'],
+                        dataset_num=dataset_num,
+                        orig_shape=orig_shape,
+                        ecut=dataset_config.get('ECUT', 0),
+                        max_deposit=dataset_config['MAXDEP'],
                     )
-            else:
-                # No embedding, preprocess directly
-                prior_preprocessed, _ = HGCal_utils.preprocess_hgcal_shower(
-                    prior_raw,
-                    e_prior,
-                    dataset_config['SHAPE_PAD'],
-                    dataset_config['SHOWERMAP'],
-                    dataset_num=dataset_num,
-                    orig_shape=orig_shape,
-                    ecut=dataset_config.get('ECUT', 0),
-                    max_deposit=dataset_config['MAXDEP'],
-                )
             
-            prior_ = prior_preprocessed.astype(np.float32)
+                prior_ = prior_preprocessed.astype(np.float32)
 
-        if(i ==0): 
-            data = data_
-            energies = e_
-            if use_pidm:
-                layers = layers_
-            if use_gmm:
-                prior = prior_
-        else:
-            data = np.concatenate((data, data_))
-            energies = np.concatenate((energies, e_))
-            if use_pidm:
-                layers = np.concatenate((layers, layers_))
-            if use_gmm:
-                prior = np.concatenate((prior, prior_))
-        
-    avg_showers = std_showers = E_bins = None
-    # NN_embed already initialized above if pre_embed is True
-
-    energies = np.reshape(energies,(-1))
-
-    # Fallback: if data is still in raw HGCal format (N, layers, cells), preprocess now
-    if (not orig_shape) and dataset_config.get('HGCAL', False) and data.ndim == 3:
-        print("[WARNING] Data appears unprocessed (raw HGCal shape). Applying preprocess_hgcal_shower...", flush=True)
-        data, energies = HGCal_utils.preprocess_hgcal_shower(
-            data,
-            energies,
-            dataset_config['SHAPE_PAD'],
-            dataset_config['SHOWERMAP'],
-            dataset_num=dataset_num,
-            orig_shape=orig_shape,
-            ecut=dataset_config.get('ECUT', 0),
-            max_deposit=dataset_config['MAXDEP'],
-        )
-    
-    # Check current data shape
-    if is_main_process():
-        print(f"Data shape before reshape: {data.shape}")
-        print(f"Data size: {data.size}")
-    
-    dshape = dataset_config['SHAPE_PAD'].copy() if isinstance(dataset_config['SHAPE_PAD'], list) else list(dataset_config['SHAPE_PAD'])
-    
-    if(not orig_shape): 
-        # Calculate expected elements per sample (all dimensions except first)
-        expected_elements_per_sample = np.prod(dshape[1:])  # 1 * 47 * 12 * 21 = 11844
-        
-        # Calculate number of samples from total size
-        num_samples = data.size // expected_elements_per_sample
-        
-        if is_main_process():
-            print(f"Expected elements per sample: {expected_elements_per_sample}")
-            print(f"Calculated number of samples: {num_samples}")
-            print(f"Original target shape: {dshape}")
-        
-        # Replace -1 with calculated number of samples
-        if dshape[0] == -1:
-            dshape[0] = num_samples
-        
-        if is_main_process():
-            print(f"Final reshape target: {tuple(dshape)}")
-            print(f"Expected total size: {np.prod(dshape)}")
-            print(f"Actual data size: {data.size}")
-        
-        # Verify the reshape is possible
-        if data.size % expected_elements_per_sample != 0:
-            raise ValueError(
-                f"Cannot reshape data: array size {data.size} is not divisible by "
-                f"expected elements per sample {expected_elements_per_sample}. "
-                f"Data shape: {data.shape}, Target shape per sample: {tuple(dshape[1:])}"
-            )
-        
-        if data.size != np.prod(dshape):
-            # Try to reshape with -1 to let numpy figure it out
-            if is_main_process():
-                print(f"Warning: Size mismatch. Attempting reshape with -1 for first dimension...")
-            dshape_auto = [-1] + dshape[1:]
-            data = np.reshape(data, tuple(dshape_auto))
-            if is_main_process():
-                print(f"Reshaped to: {data.shape}")
-        else:
-            data = np.reshape(data, tuple(dshape))
-        
-        if use_gmm:
-            if prior.size != np.prod(dshape):
-                dshape_prior = [-1] + dshape[1:]
-                prior = np.reshape(prior, tuple(dshape_prior))
+            if(i ==0): 
+                data = data_
+                energies = e_
+                if use_pidm:
+                    layers = layers_
+                if use_gmm:
+                    prior = prior_
             else:
-                prior = np.reshape(prior, tuple(dshape))
-    else: 
-        data = np.reshape(data, (data.shape[0], -1))
+                data = np.concatenate((data, data_))
+                energies = np.concatenate((energies, e_))
+                if use_pidm:
+                    layers = np.concatenate((layers, layers_))
+                if use_gmm:
+                    prior = np.concatenate((prior, prior_))
+        
+        avg_showers = std_showers = E_bins = None
+        # NN_embed already initialized above if pre_embed is True
+
+        energies = np.reshape(energies,(-1))
+
+        # Fallback: if data is still in raw HGCal format (N, layers, cells), preprocess now
+        if (not orig_shape) and dataset_config.get('HGCAL', False) and data.ndim == 3:
+            print("[WARNING] Data appears unprocessed (raw HGCal shape). Applying preprocess_hgcal_shower...", flush=True)
+            data, energies = HGCal_utils.preprocess_hgcal_shower(
+                data,
+                energies,
+                dataset_config['SHAPE_PAD'],
+                dataset_config['SHOWERMAP'],
+                dataset_num=dataset_num,
+                orig_shape=orig_shape,
+                ecut=dataset_config.get('ECUT', 0),
+                max_deposit=dataset_config['MAXDEP'],
+            )
+    
+        # Check current data shape
+        if is_main_process():
+            print(f"Data shape before reshape: {data.shape}")
+            print(f"Data size: {data.size}")
+    
+        dshape = dataset_config['SHAPE_PAD'].copy() if isinstance(dataset_config['SHAPE_PAD'], list) else list(dataset_config['SHAPE_PAD'])
+    
+        if(not orig_shape): 
+            # Calculate expected elements per sample (all dimensions except first)
+            expected_elements_per_sample = np.prod(dshape[1:])  # 1 * 47 * 12 * 21 = 11844
+        
+            # Calculate number of samples from total size
+            num_samples = data.size // expected_elements_per_sample
+        
+            if is_main_process():
+                print(f"Expected elements per sample: {expected_elements_per_sample}")
+                print(f"Calculated number of samples: {num_samples}")
+                print(f"Original target shape: {dshape}")
+        
+            # Replace -1 with calculated number of samples
+            if dshape[0] == -1:
+                dshape[0] = num_samples
+        
+            if is_main_process():
+                print(f"Final reshape target: {tuple(dshape)}")
+                print(f"Expected total size: {np.prod(dshape)}")
+                print(f"Actual data size: {data.size}")
+        
+            # Verify the reshape is possible
+            if data.size % expected_elements_per_sample != 0:
+                raise ValueError(
+                    f"Cannot reshape data: array size {data.size} is not divisible by "
+                    f"expected elements per sample {expected_elements_per_sample}. "
+                    f"Data shape: {data.shape}, Target shape per sample: {tuple(dshape[1:])}"
+                )
+        
+            if data.size != np.prod(dshape):
+                # Try to reshape with -1 to let numpy figure it out
+                if is_main_process():
+                    print(f"Warning: Size mismatch. Attempting reshape with -1 for first dimension...")
+                dshape_auto = [-1] + dshape[1:]
+                data = np.reshape(data, tuple(dshape_auto))
+                if is_main_process():
+                    print(f"Reshaped to: {data.shape}")
+            else:
+                data = np.reshape(data, tuple(dshape))
+        
+            if use_gmm:
+                if prior.size != np.prod(dshape):
+                    dshape_prior = [-1] + dshape[1:]
+                    prior = np.reshape(prior, tuple(dshape_prior))
+                else:
+                    prior = np.reshape(prior, tuple(dshape))
+        else: 
+            data = np.reshape(data, (data.shape[0], -1))
+            if use_gmm:
+                prior = np.reshape(prior, (prior.shape[0], -1))
+
+        num_data = data.shape[0]
+        if is_main_process():
+            print("Data Shape " + str(data.shape))
+        data_size = data.shape[0]
+
+        # Prepare torch tensors
+        torch_data_tensor = torch.from_numpy(data)
+        torch_E_tensor = torch.from_numpy(energies)
+        if use_pidm:
+            torch_layers_tensor = torch.from_numpy(layers)
+    
+        if use_gmm and is_main_process():
+            prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
+            torch_data_tensor = torch_data_tensor.cpu()
+            torch_E_tensor = torch_E_tensor.cpu()
+            if use_pidm:
+                torch_layers_tensor = torch_layers_tensor.cpu()
+            print("DATA mean, sum, std, shape", torch.mean(torch_data_tensor), torch.sum(prior_flat_all),torch.std(torch_data_tensor), torch_data_tensor.shape)
+            print("PRIOR mean, sum, std, shape", torch.mean(prior_flat_all),torch.sum(prior_flat_all), torch.std(prior_flat_all), prior_flat_all.shape)
+            print(f'prior shape {prior_flat_all.shape}')
+        elif use_gmm:
+            prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
+            torch_data_tensor = torch_data_tensor.cpu()
+            torch_E_tensor = torch_E_tensor.cpu()
+            if use_pidm:
+                torch_layers_tensor = torch_layers_tensor.cpu()
+    
+        del data
         if use_gmm:
-            prior = np.reshape(prior, (prior.shape[0], -1))
-
-    num_data = data.shape[0]
-    if is_main_process():
-        print("Data Shape " + str(data.shape))
-    data_size = data.shape[0]
-
-    # Prepare torch tensors
-    torch_data_tensor = torch.from_numpy(data)
-    torch_E_tensor = torch.from_numpy(energies)
-    if use_pidm:
-        torch_layers_tensor = torch.from_numpy(layers)
-    
-    if use_gmm and is_main_process():
-        prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
-        torch_data_tensor = torch_data_tensor.cpu()
-        torch_E_tensor = torch_E_tensor.cpu()
+            del prior
         if use_pidm:
-            torch_layers_tensor = torch_layers_tensor.cpu()
-        print("DATA mean, sum, std, shape", torch.mean(torch_data_tensor), torch.sum(prior_flat_all),torch.std(torch_data_tensor), torch_data_tensor.shape)
-        print("PRIOR mean, sum, std, shape", torch.mean(prior_flat_all),torch.sum(prior_flat_all), torch.std(prior_flat_all), prior_flat_all.shape)
-        print(f'prior shape {prior_flat_all.shape}')
-    elif use_gmm:
-        prior_flat_all = torch.from_numpy(prior).cpu().view(torch_data_tensor.shape)
-        torch_data_tensor = torch_data_tensor.cpu()
-        torch_E_tensor = torch_E_tensor.cpu()
-        if use_pidm:
-            torch_layers_tensor = torch_layers_tensor.cpu()
-    
-    del data
-    if use_gmm:
-        del prior
-    if use_pidm:
-        del layers
+            del layers
 
-    # Create dataset
-    if use_gmm:
-        if use_pidm:
-            torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all, torch_layers_tensor)
+        # Create dataset
+        if use_gmm:
+            if use_pidm:
+                torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all, torch_layers_tensor)
+            else:
+                torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all)
+            del prior_flat_all
         else:
-            torch_dataset = torchdata.TensorDataset(torch_data_tensor, torch_E_tensor, prior_flat_all)
-        del prior_flat_all
-    else:
-        if use_pidm:
-            torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor, torch_layers_tensor)
+            if use_pidm:
+                torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor, torch_layers_tensor)
+            else:
+                torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor)
+    
+        nTrain = int(round(flags.frac * num_data))
+        nVal = num_data - nTrain
+        split_gen = torch.Generator().manual_seed(flags.seed)
+        train_dataset, val_dataset = torch.utils.data.random_split(torch_dataset, [nTrain, nVal], generator=split_gen)
+
+        # Avoid batch_size=1 for PIDM + layer maps (ReverseNormHGCal squeezes batch dim)
+        drop_last = use_pidm and ("layer" in dataset_config.get("SHOWERMAP", ""))
+        if use_ddp:
+            train_sampler = torchdata.distributed.DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+            val_sampler = torchdata.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+            loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=False, drop_last=drop_last)
+            loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, shuffle=False, drop_last=drop_last)
         else:
-            torch_dataset = torchdata.TensorDataset(torch_E_tensor, torch_data_tensor)
-    
-    nTrain = int(round(flags.frac * num_data))
-    nVal = num_data - nTrain
-    split_gen = torch.Generator().manual_seed(flags.seed)
-    train_dataset, val_dataset = torch.utils.data.random_split(torch_dataset, [nTrain, nVal], generator=split_gen)
+            train_sampler = None
+            loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
+            loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
 
-    # Avoid batch_size=1 for PIDM + layer maps (ReverseNormHGCal squeezes batch dim)
-    drop_last = use_pidm and ("layer" in dataset_config.get("SHOWERMAP", ""))
-    if use_ddp:
-        train_sampler = torchdata.distributed.DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        val_sampler = torchdata.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-        loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=False, drop_last=drop_last)
-        loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, shuffle=False, drop_last=drop_last)
-    else:
-        train_sampler = None
-        loader_train = torchdata.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
-        loader_val = torchdata.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
-
-    del torch_data_tensor, torch_E_tensor, train_dataset, val_dataset
-    if use_pidm:
-        del torch_layers_tensor
+        del torch_data_tensor, torch_E_tensor, train_dataset, val_dataset
+        if use_pidm:
+            del torch_layers_tensor
     
+
     # Use provided checkpoint folder or default to ../models/{CHECKPOINT_NAME}_{model}/
     if flags.checkpoint is not None:
         checkpoint_folder = flags.checkpoint
@@ -683,21 +809,31 @@ if __name__ == '__main__':
     
     #training loop
     for epoch in range(start_epoch, num_epochs):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         if use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if stream_h5:
+            if hasattr(loader_train.dataset, "set_epoch"):
+                loader_train.dataset.set_epoch(epoch)
+            if hasattr(loader_val.dataset, "set_epoch"):
+                loader_val.dataset.set_epoch(epoch)
         if is_main_process():
             print("Beginning epoch %i" % epoch, flush=True)
         for i, param in enumerate(model.parameters()):
             break
         train_loss = 0
+        train_steps = 0
 
         model.train()
         train_iter = enumerate(loader_train, 0)
         if is_main_process():
-            train_pbar = tqdm(train_iter, unit="batch", total=len(loader_train))
+            train_total = None if stream_h5 else len(loader_train)
+            train_pbar = tqdm(train_iter, unit="batch", total=train_total)
         else:
             train_pbar = train_iter
         for i, batch in train_pbar:
+            train_steps += 1
             model.zero_grad()
             optimizer.zero_grad()
 
@@ -796,7 +932,9 @@ if __name__ == '__main__':
                         ref_loss=f"{batch_loss_ref_value:.4f}",
                     )
 
-        num_train_batches = len(loader_train)
+        if train_steps == 0:
+            raise RuntimeError("No training batches produced; check STREAM_H5 settings and file lists.")
+        num_train_batches = train_steps
         if use_ddp:
             t = torch.tensor([train_loss, num_train_batches], device=device, dtype=torch.float32)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -808,13 +946,16 @@ if __name__ == '__main__':
             print("loss: "+ str(train_loss))
 
         val_loss = 0
+        val_steps = 0
         model.eval()
         val_iter = enumerate(loader_val, 0)
         if is_main_process():
-            val_pbar = tqdm(val_iter, unit="batch", total=len(loader_val))
+            val_total = None if stream_h5 else len(loader_val)
+            val_pbar = tqdm(val_iter, unit="batch", total=val_total)
         else:
             val_pbar = val_iter
         for i, batch in val_pbar:
+            val_steps += 1
             if use_gmm:
                 if use_pidm:
                     vdata, vE, vprior, vlayers = batch
@@ -886,7 +1027,9 @@ if __name__ == '__main__':
                 if use_pidm:
                     del vlayers
 
-        num_val_batches = len(loader_val)
+        if val_steps == 0:
+            raise RuntimeError("No validation batches produced; check STREAM_H5 settings and file lists.")
+        num_val_batches = val_steps
         if use_ddp:
             v = torch.tensor([val_loss, num_val_batches], device=device, dtype=torch.float32)
             dist.all_reduce(v, op=dist.ReduceOp.SUM)
@@ -896,6 +1039,7 @@ if __name__ == '__main__':
         val_losses[epoch] = val_loss
         if is_main_process():
             print("val_loss: "+ str(val_loss), flush = True)
+            _log_cuda_mem(prefix=f" epoch={epoch}")
 
         scheduler.step(torch.tensor([train_loss]))
 

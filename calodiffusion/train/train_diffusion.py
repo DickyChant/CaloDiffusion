@@ -34,6 +34,7 @@ class TrainDiffusion(Train):
         min_validation_loss = 99999.0
         for epoch in range(start_epoch, num_epochs):
             print("Beginning epoch %i" % epoch, flush=True)
+            self.reset_cuda_peak(device=self.device)
             train_loss = 0
 
             self.model.train()
@@ -102,6 +103,7 @@ class TrainDiffusion(Train):
                 val_losses[epoch] = val_loss
                 print("val_loss: " + str(val_loss), flush=True)
 
+            self.log_cuda_mem(f"epoch={epoch}", device=self.device)
             scheduler.step(torch.tensor([train_loss]))
 
             if val_loss < min_validation_loss:

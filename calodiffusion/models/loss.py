@@ -178,6 +178,12 @@ class hybrid_weight(Loss):
 
         return self.loss(pred, target, weight)
 
+class hybrid_weight_karras(hybrid_weight):
+    """
+    Alias for legacy configs that refer to hybrid_weight_karras.
+    """
+    pass
+
 class noise_pred(Loss):
     def __init__(self, config, n_steps, loss_type='l1') -> None:
         super().__init__(config, n_steps, loss_type)

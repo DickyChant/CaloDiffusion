@@ -22,6 +22,16 @@ class dotdict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
+def _ranked_output_path(path, rank):
+    if path is None:
+        return path
+    if "{RANK}" in path:
+        return path.replace("{RANK}", str(rank))
+    if "%RANK" in path:
+        return path.replace("%RANK", str(rank))
+    base, ext = os.path.splitext(path)
+    return f"{base}_rank{rank}{ext}"
+
 @click.group()
 @click.option("-c", "--config")
 @click.option("-d", "--data-folder", default="./data/", help="Folder containing data and MC files")
@@ -46,9 +56,30 @@ def inference(ctx, debug, config, data_folder, checkpoint_folder, layer_only, jo
     ctx.obj.layer_only = layer_only
     ctx.obj.reclean = reclean
 
+    rank = int(os.getenv("RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    ctx.obj.rank = rank
+    ctx.obj.world_size = world_size
+    ctx.obj.local_rank = local_rank
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    if world_size > 1 and n_events > 0:
+        base = n_events // world_size
+        rem = n_events % world_size
+        local_nevts = base + (1 if rank < rem else 0)
+        ctx.obj.nevts_global = n_events
+        ctx.obj.nevts = local_nevts
+        ctx.obj.evt_start = base * rank + min(rank, rem)
+        if ctx.obj.job_idx < 0:
+            ctx.obj.job_idx = rank
+
     if seed is None: 
         seed = int(np.random.default_rng().integers(low=100, high=10**5))
 
+    if world_size > 1:
+        seed = int(seed) + rank
     ctx.obj.seed = seed
     ctx.obj.config['SEED'] = seed
     if hgcal is not None: 
@@ -65,10 +96,11 @@ def inference(ctx, debug, config, data_folder, checkpoint_folder, layer_only, jo
 @click.option("--sample-offset", default=0, type=int, help="Skip some iterations in the sampling (noisiest iters most unstable)")
 @click.option("--sample-algo", default="DDim", help="Algorithm for sampling the model output")
 @click.option("--sparse-decoding", default=False, is_flag=True, help="Sampling during HGCal decoding step to reduce sparsity")
+@click.option("--sparse-per-batch", default=None, type=int, help="Batch size for sparse decoding during HGCal decode")
 @click.option("--train-sampler/--no-train-sampler", default=None, help="For samplers requiring pre-training, train them (overwrites config)")
 @click.option("--model-loc", default=None, help="Specific folder for loading existing model")
 @click.pass_context
-def sample(ctx, generated, sample_steps, sample_algo, sample_offset, sparse_decoding, train_sampler, model_loc):
+def sample(ctx, generated, sample_steps, sample_algo, sample_offset, sparse_decoding, sparse_per_batch, train_sampler, model_loc):
     ctx.obj.config['SAMPLER'] = sample_algo
     if "SAMPLER_OPTIONS" not in ctx.obj.config.keys(): 
         ctx.obj.config['SAMPLER_OPTIONS'] = {}
@@ -83,6 +115,7 @@ def sample(ctx, generated, sample_steps, sample_algo, sample_offset, sparse_deco
     ctx.obj.sample_algo = sample_algo 
     ctx.obj.sample_offset = sample_offset
     ctx.obj.sparse_decoding = sparse_decoding
+    ctx.obj.sparse_per_batch = sparse_per_batch
     ctx.obj.generated = generated
 
     non_config = dotdict({key: value for key, value in ctx.obj.items() if key!='config'})
@@ -355,11 +388,20 @@ def run_inference(flags, config, model):
     )
     sample_steps = flags.sample_steps if flags.sample_steps is not None else config.get("SAMPLE_STEPS", 400)
 
-    generated, energies = model.generate(data_loader, sample_steps, flags.debug, flags.sample_offset, sparse_decoding=flags.sparse_decoding)
+    generated, energies = model.generate(
+        data_loader,
+        sample_steps,
+        flags.debug,
+        flags.sample_offset,
+        sparse_decoding=flags.sparse_decoding,
+        sparse_per_batch=flags.sparse_per_batch,
+    )
     if(flags.generated == ""):
         fout = f"{model_instance.checkpoint_folder}/generated_{config['CHECKPOINT_NAME']}_{flags.sample_algo}{sample_steps}_{datetime.now().timestamp()}.h5"
     else: 
         fout = flags.generated
+    if getattr(flags, "world_size", 1) > 1:
+        fout = _ranked_output_path(fout, flags.rank)
     write_out(fout, flags, config, generated, energies, first_write=True)
 
 if __name__ == "__main__":

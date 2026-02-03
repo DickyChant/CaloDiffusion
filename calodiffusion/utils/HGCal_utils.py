@@ -189,6 +189,7 @@ def ReverseNormHGCal(
     binning_file="",
     config=None,
     sparse_decoding=False,
+    sparse_per_batch=None,
 ):
     """Revert the transformations applied to the training set"""
 
@@ -247,7 +248,8 @@ def ReverseNormHGCal(
         NN_embed.init(norm=True, dataset_num=dataset_num)
 
     if embed:
-        data = NN_embed.dec_batches(data, sparse_decoding=sparse_decoding)
+        batch_size = sparse_per_batch if sparse_per_batch is not None else 128
+        data = NN_embed.dec_batches(data, batch_size=batch_size, sparse_decoding=sparse_decoding)
 
     # Per layer energy normalization
     if "layer" in showerMap:

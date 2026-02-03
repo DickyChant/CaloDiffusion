@@ -88,7 +88,20 @@ class CaloDiffusion(Diffusion):
             calo_summary_shape = [1, in_channels] + list(copy.copy(self.config["SHAPE_FINAL"][1:]))
 
             # Select model architecture based on SHOWER_EMBED
-            if "MFAttn" in self.shower_embed and "v1" not in self.shower_embed:
+            if "PuAttn" in self.shower_embed:
+                # PureDiT backbone (used for DiT-style MeanFlow)
+                patch_shape = self.config.get("SHAPE_PAD", self.config["SHAPE_FINAL"])[2:]
+                model = PureDiT(
+                    hidden_dim=self.config["COND_SIZE_UNET"],
+                    in_dim=in_channels,
+                    depth=self.config.get("NUM_LAYERS", 4),
+                    num_heads=self.config.get("NUM_HEADS", 8),
+                    patch_shape=patch_shape,
+                    mlp_ratio=self.config.get("MLP_RATIO", 4.0),
+                ).to(device=self.device)
+                print(f"[CaloDiffusion] Initialized PureDiT with patch_shape={patch_shape}")
+
+            elif "MFAttn" in self.shower_embed and "v1" not in self.shower_embed:
                 # MeanFlowDiT architecture for MeanFlow with attention
                 patch_shape = self.config.get("SHAPE_PAD", self.config["SHAPE_FINAL"])[2:]
                 model = MeanFlowDiT(
@@ -161,6 +174,11 @@ class CaloDiffusion(Diffusion):
         if self.config.get("LEGACY_COND_SIZE", False) and E is not None:
             if E.ndim == 2 and E.shape[1] > 1:
                 E = E[:, :1]
+
+        # PureDiT expects scalar conditioning; squeeze to (B,)
+        if "PuAttn" in self.shower_embed and E is not None:
+            if E.ndim > 1:
+                E = E[:, 0]
         rz_phi = self.add_RZPhi(x).float()
         
         # MeanFlowDiT requires r parameter
@@ -171,7 +189,13 @@ class CaloDiffusion(Diffusion):
                 r = torch.zeros_like(time)
             out = self.model(rz_phi, cond=E.float(), time=time.float(), r=r.float())
         else:
-            out = self.model(rz_phi, cond=E.float(), time=time.float(), controls=controls)
+            # PureDiT/CondUnet may not accept controls; call safely
+            import inspect
+            sig = inspect.signature(self.model.forward)
+            if "controls" in sig.parameters:
+                out = self.model(rz_phi, cond=E.float(), time=time.float(), controls=controls)
+            else:
+                out = self.model(rz_phi, cond=E.float(), time=time.float())
 
         if (self.do_embed):
             out = self.NN_embed.dec(out).to(x.device)

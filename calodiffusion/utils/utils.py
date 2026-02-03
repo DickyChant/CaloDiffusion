@@ -250,9 +250,9 @@ def DataLoader(file_name, hgcal=False, **kwargs):
         return DataLoaderCaloChall(file_name, **kwargs)
 
 
-def ReverseNorm(voxels, e, hgcal=False, **kwargs):
+def ReverseNorm(voxels, e, hgcal=False, sparse_per_batch=None, **kwargs):
     if hgcal:
-        return HGCal_utils.ReverseNormHGCal(voxels, e, **kwargs)
+        return HGCal_utils.ReverseNormHGCal(voxels, e, sparse_per_batch=sparse_per_batch, **kwargs)
     else:
         return ReverseNormCaloChall(voxels, e, **kwargs)
 
@@ -889,6 +889,9 @@ def load_data(args, config, eval=False, NN_embed=None):
     val_files = []
 
     n_showers = 0
+    evt_start = getattr(args, "evt_start", None)
+    if evt_start is None:
+        evt_start = args.job_idx * args.nevts if args.job_idx >= 0 else 0
 
     for i, dataset in enumerate(files + val_file_list):
 
@@ -910,6 +913,7 @@ def load_data(args, config, eval=False, NN_embed=None):
                 emin=config["EMIN"],
                 hgcal=hgcal,
                 nevts=args.nevts,
+                evt_start=evt_start,
                 binning_file=geom_file,
                 max_deposit=config[
                     "MAXDEP"
@@ -1011,10 +1015,11 @@ def apply_mask_conserveE(generated, mask):
 
 def get_device():
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    return device
+        local_rank = os.getenv("LOCAL_RANK")
+        if local_rank is not None:
+            return torch.device(f"cuda:{local_rank}")
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 def subsample_alphas(alpha, time, x_shape):
     batch_size = time.shape[0]

@@ -14,6 +14,29 @@ from calodiffusion.utils import utils
 from calodiffusion.utils import HGCal_utils
 from calodiffusion.models.calodiffusion import CaloDiffu
 
+def _reset_cuda_peak(device=None):
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.reset_peak_memory_stats(device=device)
+    except TypeError:
+        torch.cuda.reset_peak_memory_stats()
+
+def _log_cuda_mem(tag, device=None):
+    if not torch.cuda.is_available():
+        return
+    try:
+        alloc = torch.cuda.memory_allocated(device=device)
+        reserved = torch.cuda.memory_reserved(device=device)
+        peak = torch.cuda.max_memory_allocated(device=device)
+    except TypeError:
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        peak = torch.cuda.max_memory_allocated()
+    print(
+        f"[MEM] {tag}: alloc={alloc/1e6:.1f}MB reserved={reserved/1e6:.1f}MB peak={peak/1e6:.1f}MB",
+        flush=True,
+    )
 
 if __name__ == '__main__':
     print("TRAIN DIFFU (SiT Mode)")
@@ -609,6 +632,7 @@ if __name__ == '__main__':
     #training loop
     for epoch in range(start_epoch, num_epochs):
         print("Beginning epoch %i" % epoch, flush=True)
+        _reset_cuda_peak(device=device)
         for i, param in enumerate(model.parameters()):
             break
         train_loss = 0
@@ -757,6 +781,7 @@ if __name__ == '__main__':
         val_losses[epoch] = val_loss
         print("val_loss: "+ str(val_loss), flush = True)
 
+        _log_cuda_mem(f"epoch={epoch}", device=device)
         scheduler.step(torch.tensor([train_loss]))
 
         if(val_loss < min_validation_loss):

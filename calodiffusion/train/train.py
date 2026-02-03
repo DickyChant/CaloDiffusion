@@ -40,6 +40,32 @@ class Train(ABC):
         with open(os.path.join(self.checkpoint_folder, "config.json"), "w") as config_file:
             json.dump(flags.config, config_file) 
 
+    @staticmethod
+    def reset_cuda_peak(device=None):
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.reset_peak_memory_stats(device=device)
+        except TypeError:
+            torch.cuda.reset_peak_memory_stats()
+
+    @staticmethod
+    def log_cuda_mem(tag, device=None):
+        if not torch.cuda.is_available():
+            return
+        try:
+            alloc = torch.cuda.memory_allocated(device=device)
+            reserved = torch.cuda.memory_reserved(device=device)
+            peak = torch.cuda.max_memory_allocated(device=device)
+        except TypeError:
+            alloc = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            peak = torch.cuda.max_memory_allocated()
+        print(
+            f"[MEM] {tag}: alloc={alloc/1e6:.1f}MB reserved={reserved/1e6:.1f}MB peak={peak/1e6:.1f}MB",
+            flush=True,
+        )
+
     @abstractmethod
     def init_model(self): 
         raise NotImplementedError
