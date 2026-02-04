@@ -259,15 +259,24 @@ def ReverseNormHGCal(
         layers = (layers * c["layers_std"]) + c["layers_mean"]
 
         layers = reverse_logit(layers)
+        # Numerical safety: layer fractions represent probabilities and should be in [0, 1].
+        # Without this, extreme logits can under/overflow and produce slight negatives or >1.
+        layers = np.clip(layers, 0.0, 1.0)
+        # Total deposited energy should be non-negative.
+        totalE = np.clip(totalE, 0.0, None)
 
         # scale layer energies to total deposited energy
-        layers /= np.sum(layers, axis=1, keepdims=True)
+        layer_sum = np.sum(layers, axis=1, keepdims=True)
+        layers = np.divide(layers, layer_sum, out=np.zeros_like(layers), where=(layer_sum > 0))
         layers *= totalE
 
         data = np.squeeze(data)
 
         # remove voxels with negative energies so they don't mess up sums
         eps = 1e-8
+        if config is not None:
+            # Threshold used to treat a target per-layer energy as "zero" during renormalization.
+            eps = float(config.get("LAYER_ZERO_EPS", eps))
         data[data < 0] = 0
 
         # Renormalize layer energies
@@ -287,9 +296,17 @@ def ReverseNormHGCal(
             layers = layers.reshape((-1, data.shape[1], 1))
         
         rescale_facs = layers / (prev_layers + 1e-10)
-        # If layer is essential zero from base network or layer network, don't rescale
-        rescale_facs[layers < eps] = 1.0
-        rescale_facs[prev_layers < eps] = 1.0
+
+        # If the target layer energy is (effectively) zero, force that layer to zero.
+        # Otherwise, leaving rescale_facs=1.0 will preserve decoder leakage and destroy the
+        # expected "zero-energy spike" in per-layer energy distributions.
+        zero_target = layers < eps
+        rescale_facs[zero_target] = 0.0
+
+        # If the current layer sum is ~0 but the target is non-zero, avoid exploding factors.
+        # (If data is truly zero, scaling can't create energy anyway; if it's numerical noise,
+        # huge factors are harmful.)
+        rescale_facs[(prev_layers < eps) & (~zero_target)] = 1.0
         data *= rescale_facs
 
     # Reshape energy to match data dimensions for broadcasting
