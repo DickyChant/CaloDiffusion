@@ -251,8 +251,19 @@ def ReverseNormHGCal(
         batch_size = sparse_per_batch if sparse_per_batch is not None else 128
         data = NN_embed.dec_batches(data, batch_size=batch_size, sparse_decoding=sparse_decoding)
 
-    # Per layer energy normalization
+    # For layer-based HGCal maps, downstream code expects (B, L, ...) arrays (no singleton channel dim).
+    # Keep previous behavior for non-layer showerMap variants.
     if "layer" in showerMap:
+        data = np.squeeze(data)
+
+    disable_layer_renorm = False
+    if config is not None:
+        # When True, do not force per-layer energies to match the provided layerE.
+        # This lets a single model "free float" the layer energy distribution.
+        disable_layer_renorm = bool(config.get("DISABLE_LAYER_RENORM", False))
+
+    # Per layer energy normalization (optional)
+    if "layer" in showerMap and not disable_layer_renorm:
         assert layerE is not None
         totalE, layers = layerE[:, :1], layerE[:, 1:]
         totalE = (totalE * c["totalE_std"]) + c["totalE_mean"]
@@ -269,8 +280,6 @@ def ReverseNormHGCal(
         layer_sum = np.sum(layers, axis=1, keepdims=True)
         layers = np.divide(layers, layer_sum, out=np.zeros_like(layers), where=(layer_sum > 0))
         layers *= totalE
-
-        data = np.squeeze(data)
 
         # remove voxels with negative energies so they don't mess up sums
         eps = 1e-8

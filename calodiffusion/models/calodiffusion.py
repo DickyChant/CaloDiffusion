@@ -37,7 +37,12 @@ class CaloDiffusion(Diffusion):
         )
         self.phi_image = utils.create_phi_image(self.device, shape=self.config["SHAPE_FINAL"][1:])
         self.training_objective = self.config.get("TRAINING_OBJ", "noise_pred")
-        self.layer_cond = "layer" in config.get("SHOWERMAP", "")
+        # Whether to append per-layer energy conditioning to the conditional vector.
+        # Note: This is independent from whether SHOWERMAP includes "layer" (which controls
+        # preprocessing and optional ReverseNorm layer renormalization).
+        self.layer_cond = "layer" in self.config.get("SHOWERMAP", "")
+        if self.config.get("DISABLE_LAYER_COND", False):
+            self.layer_cond = False
 
         self.model = self.init_model()
         self.NN_embed = self.init_embedding_model()
@@ -80,6 +85,13 @@ class CaloDiffusion(Diffusion):
             if self.config.get("LEGACY_COND_SIZE", False):
                 # Old checkpoints used only energy conditioning; disable layer conditioning
                 cond_size = 1
+                self.layer_cond = False
+            elif self.config.get("DISABLE_LAYER_COND", False):
+                # Keep SHOWERMAP="layer-..." for preprocessing/ReverseNorm, but do not condition the
+                # network on layerE. Use only the generator-level conditioning (energy [+ angles]).
+                cond_size = 1
+                if self.hgcal:
+                    cond_size += 2
                 self.layer_cond = False
             else:
                 cond_size = 2 + self.config["SHAPE_FINAL"][2] if "layer" in self.config.get("SHOWERMAP", "") else 1
