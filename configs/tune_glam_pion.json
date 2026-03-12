@@ -1,0 +1,15 @@
+{
+    "particle": "pion",
+    "geom_file": "CMSHGCaloChallenge/HGCalShowers/geoms/HGCal_geo_2024_large.pkl",
+    "data_dir": "/pscratch/sd/s/sqian/HGCal_sim_samples/SinglePion/",
+    "max_files": 20,
+    "nevts_per_file": 500,
+    "batch_size": 128,
+    "shower_scale": 200.0,
+    "num_layers": 47,
+    "search_space": {
+        "num_alpha_bins": [6, 36],
+        "num_r_bins": [12, 96]
+    },
+    "n_trials": 100
+}
