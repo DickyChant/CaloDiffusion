@@ -510,7 +510,7 @@ def init_map(num_alpha_bins, num_r_bins, geom, ilay, trainable=False):
         # matrix is size of largest layer, but only process up to size of this layer
         a_bin = cell_ang_bins[i] % num_alpha_bins
         ring_idx = int(round(geom.ring_map[ilay, i]))
-        r_bin = r_binning[ring_idx]
+        r_bin = min(int(r_binning[ring_idx]), num_r_bins - 1)
         if close_boundaries[i]:
             weight_mat[a_bin, r_bin, i] = 0.5
             weight_mat[a_bin - 1, r_bin, i] = 0.5
@@ -662,7 +662,8 @@ class HGCalConverter(torch.nn.Module):
             )
             conv_map = conv_map.to(device=self.device)
             # How to define sparse mask of inverse ?
-            inv_init = torch.linalg.pinv(conv_map)
+            # pinv on CPU to avoid cusolver errors on GPU for some matrix sizes
+            inv_init = torch.linalg.pinv(conv_map.cpu()).to(device=self.device)
 
             eps = 1e-6
             # cleanup some noise from inverse
@@ -731,7 +732,7 @@ class HGCalConverter(torch.nn.Module):
         for i in range(1, ncells):
             # matrix is size of largest layer, but only process up to size of this layer
             a_bin = cell_ang_bins[i] % num_alpha_bins
-            r_bin = int(round(geom.ring_map[ilay, i]))
+            r_bin = min(int(round(geom.ring_map[ilay, i])), num_r_bins - 1)
             if close_boundaries[i]:
                 weight_mat[a_bin, r_bin, i] = 0.5
                 weight_mat[a_bin - 1, r_bin, i] = 0.5
