@@ -857,7 +857,7 @@ def get_files(flist, folder=""):
         return []
 
 
-def load_data(args, config, eval=False, NN_embed=None):
+def load_data(args, config, eval=False, NN_embed=None, distributed=False):
 
     nholdout = config.get("HOLDOUT", 0)
     batch_size = config["BATCH"]
@@ -977,18 +977,46 @@ def load_data(args, config, eval=False, NN_embed=None):
                 break
 
     dataset_train = Dataset(train_files)
+    
+    # Create distributed sampler if requested
+    sampler_train = None
+    sampler_val = None
+    shuffle_train = True
+    
+    if distributed:
+        sampler_train = torch.utils.data.distributed.DistributedSampler(
+            dataset_train,
+            shuffle=True
+        )
+        shuffle_train = False  # Sampler handles shuffling
+    
     loader_train = torchdata.DataLoader(
-        dataset_train, batch_size=batch_size, pin_memory=True
+        dataset_train, 
+        batch_size=batch_size, 
+        pin_memory=True,
+        sampler=sampler_train,
+        shuffle=shuffle_train
     )
 
     loader_val = None
     if len(val_files) > 0:
         dataset_val = Dataset(val_files)
+        
+        if distributed:
+            sampler_val = torch.utils.data.distributed.DistributedSampler(
+                dataset_val,
+                shuffle=False  # Don't shuffle validation data
+            )
+        
         loader_val = torchdata.DataLoader(
-            dataset_val, batch_size=batch_size, pin_memory=True
+            dataset_val, 
+            batch_size=batch_size, 
+            pin_memory=True,
+            sampler=sampler_val,
+            shuffle=False
         )
 
-    return loader_train, loader_val
+    return loader_train, loader_val, sampler_train, sampler_val
 
 
 def subsample_alphas(alpha, time, x_shape):

@@ -49,8 +49,15 @@ class dotdict(dict):
 )
 @click.option("--hgcal/--no-hgcal", default=None, is_flag=True, help="Use HGCal settings (overwrites config)")
 @click.option("--model-loc", default=None, help="Specify existing model to load")
+@click.option("--enable-ddp", is_flag=True, default=False, help="Enable DDP even on single GPU (for debugging)")
+@click.option("--n-nodes", type=int, default=1, help="Number of nodes for distributed training")
+@click.option("--gpus-per-node", type=int, default=1, help="Number of GPUs per node")
+@click.option("--master-addr", default="localhost", help="Master node address for distributed training")
+@click.option("--master-port", default="29500", help="Master node port for distributed training")
+@click.option("--backend", default="nccl", help="Distributed backend (nccl or gloo)")
 @click.pass_context
-def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal): 
+def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal, 
+          enable_ddp, n_nodes, gpus_per_node, master_addr, master_port, backend): 
     ctx.ensure_object(dotdict)
 
     ctx.obj.config = utils.LoadJson(config)
@@ -65,6 +72,14 @@ def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, 
     ctx.obj.reset_training = reset_training
     ctx.obj.hgcal = hgcal
     ctx.obj.model_loc = model_loc
+    
+    # DDP options
+    ctx.obj.enable_ddp = enable_ddp
+    ctx.obj.n_nodes = n_nodes
+    ctx.obj.gpus_per_node = gpus_per_node
+    ctx.obj.master_addr = master_addr
+    ctx.obj.master_port = master_port
+    ctx.obj.backend = backend
 
     if hgcal is not None: 
         ctx.obj.config['HGCAL'] = hgcal
