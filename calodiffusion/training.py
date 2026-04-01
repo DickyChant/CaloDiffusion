@@ -2,6 +2,7 @@ import click
 from calodiffusion.utils import utils
 from calodiffusion.train.train_diffusion import TrainDiffusion
 from calodiffusion.train.train_layer_model import TrainLayerModel
+from calodiffusion.train.train_meanflow import TrainMeanFlow, TrainMeanFlowDDP
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -49,8 +50,9 @@ class dotdict(dict):
 )
 @click.option("--hgcal/--no-hgcal", default=None, is_flag=True, help="Use HGCal settings (overwrites config)")
 @click.option("--model-loc", default=None, help="Specify existing model to load")
+@click.option("--gmm-prior", default=None, help="Path to GMM checkpoint (.pt file) for sampling prior on-the-fly (for MeanFlow with GMM)")
 @click.pass_context
-def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal): 
+def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, reclean, reset_training, model_loc, hgcal, gmm_prior): 
     ctx.ensure_object(dotdict)
 
     ctx.obj.config = utils.LoadJson(config)
@@ -65,6 +67,7 @@ def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, 
     ctx.obj.reset_training = reset_training
     ctx.obj.hgcal = hgcal
     ctx.obj.model_loc = model_loc
+    ctx.obj.gmm_prior = gmm_prior
 
     if hgcal is not None: 
         ctx.obj.config['HGCAL'] = hgcal
@@ -76,16 +79,57 @@ def train(ctx, config, data_folder, checkpoint_folder, nevts, frac, load, seed, 
 @train.command()
 @click.pass_context
 def diffusion(ctx): 
+    ctx.obj.model = "diffusion"
     TrainDiffusion(ctx.obj, ctx.obj.config).train()
 
 @train.command()
 @click.option("--layer-model-loc", default=None, help="Specify existing layer model to load")
 @click.pass_context
 def layer(ctx, layer_model_loc):
+    ctx.obj.model = "layer"
     if (layer_model_loc is not None) and ctx.obj.load: 
         ctx.obj.config['layer_model'] = layer_model_loc 
 
     TrainLayerModel(ctx.obj, ctx.obj.config).train()
+
+
+@train.command()
+@click.pass_context
+def meanflow(ctx):
+    """Train MeanFlow diffusion model (with optional GMM prior)."""
+    ctx.obj.model = "meanflow"
+    TrainMeanFlow(ctx.obj, ctx.obj.config).train()
+
+
+@train.command("meanflow-ddp")
+@click.pass_context
+def meanflow_ddp(ctx):
+    """
+    Train MeanFlow diffusion model with multi-GPU support.
+    
+    This command enables multi-GPU training on a single node using manual
+    gradient synchronization. Unlike standard DDP, the model is NOT wrapped
+    with DistributedDataParallel because MeanFlow uses JVP (Jacobian-vector
+    product) which has compatibility issues with DDP's gradient hooks.
+    
+    Instead, this approach:
+    - Uses DistributedSampler to shard data across GPUs
+    - Each GPU computes gradients independently (JVP works normally)  
+    - Manually synchronizes gradients using all-reduce after backward()
+    - Only main process (rank 0) saves checkpoints
+    
+    Usage:
+    
+    \b
+    # Single node, multi-GPU (4 GPUs):
+    torchrun --nproc_per_node=4 -m calodiffusion.training \\
+        -c config.json -d /path/to/data meanflow-ddp
+    
+    The batch size per GPU can be configured using BATCH_MEANFLOW in the config.
+    The effective total batch size will be BATCH_MEANFLOW * num_gpus.
+    """
+    ctx.obj.model = "meanflow-ddp"
+    TrainMeanFlowDDP(ctx.obj, ctx.obj.config).train()
 
 
 if __name__ == "__main__": 
