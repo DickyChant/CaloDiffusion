@@ -3,6 +3,12 @@ from calodiffusion.utils.common import *
 from HGCalShowers.HGCalGeo import HGCalGeo
 import calodiffusion.utils.consts as constants
 
+try:
+    from calodiffusion.utils.triton_sparse import sparse_decode_fused
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 def logit(x, alpha=1e-8):
     o = alpha + (1 - 2 * alpha) * x
@@ -344,8 +350,11 @@ class Decoder(nn.Module):
 
         out = rearrange(x, " ... l a r -> ... l (a r)", a=self.dim1, r=self.dim2)
         if(sparse_decoding):
-            masked_mat = generate_sparse_mat(masked_mat, batches=x.shape[0], per_batch=sparse_per_batch)
-            out = torch.einsum("b l n e, b c l e ->  b c l n", masked_mat, out)
+            if _HAS_TRITON and out.is_cuda:
+                out = sparse_decode_fused(masked_mat, out, per_batch=sparse_per_batch)
+            else:
+                masked_mat = generate_sparse_mat(masked_mat, batches=x.shape[0], per_batch=sparse_per_batch)
+                out = torch.einsum("b l n e, b c l e ->  b c l n", masked_mat, out)
         else:
             out = torch.einsum("l n e, ... l e -> ... l n", masked_mat, out)
         return out
