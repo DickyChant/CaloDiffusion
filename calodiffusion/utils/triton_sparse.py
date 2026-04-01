@@ -157,7 +157,8 @@ if HAS_TRITON:
             acc += tl.sum(w * xv, axis=0)
 
         tl.store(
-            out_ptr + b * (C * L * N) + c * (L * N) + l * N + n, acc
+            out_ptr + b * (C * L * N) + c * (L * N) + l * N + n,
+            tl.sum(acc, axis=0),
         )
 
     @triton.jit
