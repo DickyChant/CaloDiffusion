@@ -160,11 +160,69 @@ def triton_csc_sparse_decode(dec_mat, x, alpha_bins, r_bins, per_batch=False,
     from calodiffusion.utils.triton_sparse import sparse_decode_csc, precompute_csc
 
     out = rearrange(x, "b c l a r -> b c l (a r)", a=alpha_bins, r=r_bins)
-    # Cache CSC structure (dec_mat is fixed)
     key = id(dec_mat)
     if key not in _csc_cache:
         _csc_cache[key] = precompute_csc(dec_mat)
     return sparse_decode_csc(dec_mat, out, _csc_cache[key], per_batch=per_batch)
+
+
+# ── Pure PyTorch CSC (no Triton/Numba needed) ──────────────────────────
+
+def _ensure_pytorch_csc(dec_mat, cache):
+    """Precompute CSC using pure PyTorch (same structure as triton precompute)."""
+    key = id(dec_mat)
+    if key not in cache:
+        from calodiffusion.utils.triton_sparse import precompute_csc
+        cache[key] = precompute_csc(dec_mat)
+    return cache[key]
+
+
+def pytorch_csc_sparse_decode(dec_mat, x, alpha_bins, r_bins, per_batch=False,
+                              _csc_cache={}):
+    """Pure PyTorch CSC sparse decode — works on any GPU, no Triton needed."""
+    B = x.shape[0]
+    C = x.shape[1]
+    out = rearrange(x, "b c l a r -> b c l (a r)", a=alpha_bins, r=r_bins)
+    col_indices, col_values, max_nnz = _ensure_pytorch_csc(dec_mat, _csc_cache)
+
+    L, N, E = dec_mat.shape
+    valid = col_indices >= 0  # (L, E, max_nnz)
+
+    if per_batch:
+        # Single random mask — same as _csc_per_batch_scatter
+        rand_vals = torch.rand_like(col_values) * valid.float() + col_values
+        rand_vals.scatter_(-1, torch.argmax(rand_vals, dim=-1, keepdim=True), 1.0 + 1e-6)
+        act = (rand_vals > 1.0) & valid
+        act_f = act.float()
+        weights = act_f / act_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        weights = weights * valid.float()
+
+        w = weights.unsqueeze(0).unsqueeze(0)       # (1, 1, L, E, nnz)
+        xv = out.unsqueeze(-1)                       # (B, C, L, E, 1)
+        contrib = w * xv                              # (B, C, L, E, nnz)
+    else:
+        # Per-shower random mask — (B, L, E, max_nnz), only ~33MB for pion B=64
+        valid_b = valid.unsqueeze(0)                  # (1, L, E, nnz)
+        vals_b = col_values.unsqueeze(0)              # (1, L, E, nnz)
+        rand_vals = torch.rand(B, L, E, max_nnz, device=out.device) * valid_b.float() + vals_b
+        rand_vals.scatter_(-1, torch.argmax(rand_vals, dim=-1, keepdim=True), 1.0 + 1e-6)
+        act = (rand_vals > 1.0) & valid_b
+        act_f = act.float()
+        weights = act_f / act_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        weights = weights * valid_b.float()
+
+        w = weights.unsqueeze(1)                      # (B, 1, L, E, nnz)
+        xv = out.unsqueeze(-1)                        # (B, C, L, E, 1)
+        contrib = w * xv                              # (B, C, L, E, nnz)
+
+    BE = E * max_nnz
+    contrib_flat = contrib.reshape(B, C, L, BE)
+    idx = col_indices.clamp(min=0).long()
+    idx_flat = idx.reshape(1, 1, L, BE).expand(B, C, L, BE)
+
+    result = torch.zeros(B, C, L, N, device=out.device, dtype=torch.float32)
+    result.scatter_add_(3, idx_flat, contrib_flat)
+    return result
 
 
 # ── Benchmarking utilities ──────────────────────────────────────────────
@@ -330,6 +388,33 @@ def main():
                           f"{'OOM':>10} {'':>8} {'':>10} {'':>10}")
                     all_results.append({
                         "config": cfg_name, "impl": "chunked",
+                        "batch": B, "mode": mode, "OOM": True,
+                    })
+                    torch.cuda.empty_cache()
+
+                # — PyTorch CSC (no Triton needed) —
+                try:
+                    mean, std, mem = benchmark_fn(
+                        lambda: pytorch_csc_sparse_decode(
+                            dec_mat, x, alpha, r, per_batch
+                        ),
+                        args.num_warmup, args.num_iters,
+                    )
+                    per = mean / B
+                    print(f"{'pt_csc':<10} {B:>4} {mode:>11} "
+                          f"{mean:>10.2f} {std:>8.2f} {per:>10.3f} {mem:>10.1f}")
+                    all_results.append({
+                        "config": cfg_name, "impl": "pytorch_csc",
+                        "batch": B, "mode": mode,
+                        "mean_ms": round(mean, 3), "std_ms": round(std, 3),
+                        "ms_per_sample": round(per, 3),
+                        "peak_MB": round(mem, 1),
+                    })
+                except torch.cuda.OutOfMemoryError:
+                    print(f"{'pt_csc':<10} {B:>4} {mode:>11} "
+                          f"{'OOM':>10} {'':>8} {'':>10} {'':>10}")
+                    all_results.append({
+                        "config": cfg_name, "impl": "pytorch_csc",
                         "batch": B, "mode": mode, "OOM": True,
                     })
                     torch.cuda.empty_cache()
