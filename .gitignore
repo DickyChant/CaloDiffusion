@@ -8,3 +8,6 @@ slurm/diffu*
 .triton*/*
 submission/container.sif
 submission/*.tar.gz
+submission/CaloDiffusion/
+submission/test_generation_calodif_*.h5
+checkpoints/

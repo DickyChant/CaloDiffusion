@@ -1,56 +1,69 @@
 # CMSHGCaloChallenge — CaloDiffusion submission (Triton sparse decoding)
 
-Triton-accelerated sparse decoding variant of the CaloDiffusion sampler. The
-HGCal `Decoder` automatically routes through a fused Triton CSC kernel
+Triton-accelerated sparse-decoding variant of the CaloDiffusion sampler. The
+HGCal `Decoder` automatically routes through the fused Triton CSC kernel
 (`calodiffusion/utils/triton_sparse.py:sparse_decode_csc`) when CUDA + Triton
-are available; the kernel is ~6× faster than the dense sparse-mat path on
-pion (large `N`) and amortizes the per-shape precompute via a cache on the
-`Decoder` instance.
+are available; the kernel only touches the ~5 nonzero entries per column
+(out of N=22268 for pion) and amortizes its precompute via a per-Decoder
+cache keyed on the underlying tensor's `data_ptr`. Trainable Decoders fall
+back to the tiled fused kernel.
 
 ## Tarball layout
 
-The submitted `.tar.gz` must contain:
+The submitted `.tar.gz` contains:
 
 ```
 .
 ├── container.def
-├── container.sif        ← built by you (apptainer build --fakeroot)
+├── container.sif                ← built by you
 ├── run-photon-sample.sh
 ├── run-pion-sample.sh
 ├── README.md
-└── CaloDiffusion/       ← the runtime code (this repo, with submodules init'd)
+├── configs/
+│   ├── HGCal_photons.json       ← submission-friendly (relative BIN_FILE)
+│   └── HGCal_pions.json
+└── CaloDiffusion/               ← the runtime code (this repo)
     ├── calodiffusion/
-    ├── HGCalShowers/    ← submodule
+    ├── HGCalShowers/            ← submodule, populated
     ├── pyproject.toml
     └── checkpoints/
-        ├── checkpoint_HGCal_pions.pth
-        └── checkpoint_HGCal_photons.pth
+        ├── HGCal_photon_april14_Diffusion/checkpoint.pth
+        ├── HGCal_photon_april14_LayerModel/checkpoint.pth
+        ├── HGCal_pion_oct17_Diffusion/checkpoint.pth
+        └── HGCal_pion_oct17_LayerModel/checkpoint.pth
 ```
 
-## Build the image
+## End-to-end build
 
-```
+From the CaloDiffusion repo root, with checkpoints under `./checkpoints/`:
+
+```bash
+# 1. Build the apptainer image (one-off; ~3.4 GB)
 cd submission/
 apptainer build --fakeroot container.sif container.def
+
+# 2. Stage runtime code + checkpoints and bundle everything into a tarball
+./package.sh
 ```
+
+`package.sh` rsyncs the repo into `submission/CaloDiffusion/`, copies the
+four checkpoint dirs, and produces `calodiffusion-triton-submission.tar.gz`.
 
 ## Run the sample scripts
 
-```
+```bash
 ./run-pion-sample.sh   <batch_size> <n_samples> <energy>     # energy ∈ {5,50,500}
 ./run-photon-sample.sh <batch_size> <n_samples> <energy>
 ```
 
-Outputs land alongside the script as `test_generation_calodif_{pion,photon}_E<energy>.h5`.
+Recommended batch sizes (matching the training configs):
+- photon: `--batch-size 80`
+- pion:   `--batch-size 100` (uses `--sparse-per-batch` since that's how the model was trained)
 
-The runners do `pip install --no-deps -e CaloDiffusion/` inside the container
-before sampling — this is a no-op on second invocation. Triton + CUDA are
-required at runtime; `--nv` is passed to apptainer to expose the GPU.
+Outputs land alongside the script as
+`test_generation_calodif_{pion,photon}_E<energy>.h5`.
 
-## Packaging
-
-```
-tar czf calodiffusion-triton-submission.tar.gz \
-    container.def container.sif \
-    run-pion-sample.sh run-photon-sample.sh README.md CaloDiffusion/
-```
+The runners do `pip install --no-deps -e .` inside the container before
+sampling — a no-op on subsequent invocations. `--nv` exposes the GPU; `--pwd`
+sets the apptainer working directory to `CaloDiffusion/` so the
+relative `BIN_FILE` paths in the configs resolve.
