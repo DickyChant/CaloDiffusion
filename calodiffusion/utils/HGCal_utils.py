@@ -4,7 +4,11 @@ from HGCalShowers.HGCalGeo import HGCalGeo
 import calodiffusion.utils.consts as constants
 
 try:
-    from calodiffusion.utils.triton_sparse import sparse_decode_fused
+    from calodiffusion.utils.triton_sparse import (
+        sparse_decode_fused,
+        sparse_decode_csc,
+        precompute_csc,
+    )
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -344,6 +348,17 @@ class Decoder(nn.Module):
         else:
             self.mat = mat
         self.mask = mask
+        self._csc_cache = None
+        self._csc_cache_key = None
+
+    def _get_csc(self, masked_mat):
+        # CSC structure is purely a function of the (frozen) decode matrix; cache
+        # by (data_ptr, shape) so we recompute only if the underlying tensor changes.
+        key = (masked_mat.data_ptr(), tuple(masked_mat.shape), masked_mat.device)
+        if self._csc_cache_key != key:
+            self._csc_cache = precompute_csc(masked_mat)
+            self._csc_cache_key = key
+        return self._csc_cache
 
     def forward(self, x, sparse_decoding=False, sparse_per_batch=False):
         masked_mat = self.mat * self.mask if self.trainable else self.mat
@@ -351,7 +366,12 @@ class Decoder(nn.Module):
         out = rearrange(x, " ... l a r -> ... l (a r)", a=self.dim1, r=self.dim2)
         if(sparse_decoding):
             if _HAS_TRITON and out.is_cuda:
-                out = sparse_decode_fused(masked_mat, out, per_batch=sparse_per_batch)
+                if not self.trainable:
+                    csc_data = self._get_csc(masked_mat)
+                    out = sparse_decode_csc(masked_mat, out, csc_data, per_batch=sparse_per_batch)
+                else:
+                    # Trainable mat changes every step → CSC precompute cost dominates; use tiled path.
+                    out = sparse_decode_fused(masked_mat, out, per_batch=sparse_per_batch)
             else:
                 masked_mat = generate_sparse_mat(masked_mat, batches=x.shape[0], per_batch=sparse_per_batch)
                 out = torch.einsum("b l n e, b c l e ->  b c l n", masked_mat, out)
@@ -362,6 +382,8 @@ class Decoder(nn.Module):
     def set(self, mat, mask):
         self.mat.values = mat
         self.mask = mask
+        self._csc_cache = None
+        self._csc_cache_key = None
 
 def generate_sparse_mat(in_mat, batches=1, per_batch=False):
     #Generate a 'sparse' matrix for the decoding step
