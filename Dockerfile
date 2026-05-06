@@ -1,21 +1,33 @@
 # CaloDiffusion — Triton-accelerated sparse decoding container
 #
-# Base: NVIDIA PyTorch image (CUDA 12.4, cuDNN, NCCL, Python 3.12). PyTorch
-# wheels here ship Triton bundled, so the triton_sparse kernels run out of the
-# box on any Volta+ GPU.
+# Base: PyTorch 2.5.1 + CUDA 12.4 + cuDNN9 (Triton 3.1 ships in the wheel).
+# Out of the box on any Volta+ GPU.
 #
-# Build:
+# Build (run from repo root, with HGCalShowers/ and CMSHGCaloChallenge/
+# submodules populated):
+#   git submodule update --init --recursive
 #   docker build -t calodiffusion:triton .
 #
-# Run (interactive, with a host data dir mounted):
+# Sample interactively, with host data + a trained model mounted:
 #   docker run --rm -it --gpus all \
 #       -v $PWD/data:/workspace/data \
+#       -v $PWD/trained_models:/workspace/models \
 #       calodiffusion:triton bash
 #
-# The two SSH-only submodules (CaloChallenge, CMSHGCaloChallenge) are NOT
-# initialized in the image — clone them on the host and bind-mount, or run
-# `git submodule update --init` inside the container with a forwarded SSH
-# agent. The public HGCalShowers submodule is initialized at build time.
+# Generate a CMSHGCaloChallenge submission (5/50/500 GeV) in one shot:
+#   docker run --rm --gpus all \
+#       -v $PWD/trained_models:/workspace/models \
+#       -v $PWD/submission:/workspace/CaloDiffusion/submission \
+#       -e CONFIG=calodiffusion/configs/config_HGCal_pions.json \
+#       -e MODEL_DIR=/workspace/models/my_pion_run \
+#       -e N_EVENTS=50000 -e BATCH_SIZE=128 \
+#       calodiffusion:triton submit
+#
+# The two SSH-only submodules (CaloChallenge, CMSHGCaloChallenge) need to be
+# populated on the host before `docker build`, since the image cannot use the
+# host's SSH keys. HGCalShowers is public and is also pulled in via the host
+# checkout. If a submodule directory is empty, the build will fail loudly at
+# the verification step rather than producing a broken image.
 
 ARG PYTORCH_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 FROM ${PYTORCH_IMAGE}
@@ -32,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace/CaloDiffusion
 
-# Install Python deps first to maximize layer cache hits.
+# Python deps first for layer-cache friendliness.
 COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip && \
     pip install \
@@ -41,19 +53,25 @@ RUN pip install --upgrade pip && \
         "torchinfo>=1.8.0" "optuna>=4.0.0" "fvcore>=0.1.5" "torchsde>=0.2.6" \
         "click>=8.0.1" "mplhep>=0.3.57" "pytest" "pytest-dependency"
 
-# Pull only the public submodule via HTTPS so the build needs no SSH key.
-COPY .gitmodules ./
-RUN git init -q && \
-    git submodule add -f https://github.com/OzAmram/HGCalShowers HGCalShowers || true
-
+# Project + populated submodules from the host.
 COPY . .
 
 RUN pip install --no-deps -e .
 
-# Quick sanity check at build time.
+# Verify submodules are populated and Triton wires up.
+RUN test -f HGCalShowers/HGCalGeo.py \
+    || (echo "HGCalShowers submodule is empty — run 'git submodule update --init --recursive' on the host before building" && exit 1)
+RUN test -f CMSHGCaloChallenge/hgcal_metrics.py \
+    || (echo "CMSHGCaloChallenge submodule is empty — run 'git submodule update --init --recursive' on the host before building" && exit 1)
 RUN python -c "import torch; print('torch', torch.__version__); \
 import triton; print('triton', triton.__version__); \
 from calodiffusion.utils.triton_sparse import HAS_TRITON; \
 assert HAS_TRITON, 'triton import failed'; print('triton_sparse OK')"
 
+# Convenience entrypoint: 'submit' runs the 3-energy submission, anything else
+# is exec'd directly so the image still behaves like a generic shell container.
+COPY scripts/run_submission.sh /usr/local/bin/calodif-submit
+RUN chmod +x /usr/local/bin/calodif-submit
+
+ENTRYPOINT ["/bin/bash", "-c", "if [ \"$1\" = submit ]; then exec calodif-submit; else exec \"$@\"; fi", "--"]
 CMD ["bash"]

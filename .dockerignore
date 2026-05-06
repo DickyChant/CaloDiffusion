@@ -8,9 +8,12 @@ __pycache__
 *.egg-info
 trained_models
 data
+submission
 *.h5
 *.hdf5
 *.pth
 *.pt
 slurm/diffu*
 .claude
+# Ignore nested submodule .git pointers (avoid leaking host paths).
+**/.git

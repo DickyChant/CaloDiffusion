@@ -1,0 +1,29 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+# CaloDiffusion submission container — Triton-accelerated sparse decoding
+#
+# Build:
+#   apptainer build --fakeroot container.sif container.def
+#
+# The CaloDiffusion source tree is mounted at runtime (not baked in), so the
+# image only needs Python deps; the editable install is done in the runner
+# scripts via `apptainer exec`.
+
+%post
+    set -e
+    pip install --no-cache-dir \
+        "dask>=2023.3.0" "gpyopt>=1.2.6" "mlflow>=1.26.1" "pydot>=1.2.4" \
+        "tables>=3.9.2" "h5py>=3.11.0" "einops>=0.8.0" "scikit-learn>=1.5.2" \
+        "torchinfo>=1.8.0" "optuna>=4.0.0" "fvcore>=0.1.5" "torchsde>=0.2.6" \
+        "click>=8.0.1" "mplhep>=0.3.57"
+    # Triton ships with the PyTorch wheel in this base image (verify).
+    python -c "import triton; print('triton', triton.__version__)"
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+
+%labels
+    Author CaloDiffusion
+    Variant triton-sparse-decoding

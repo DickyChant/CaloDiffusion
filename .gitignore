@@ -6,3 +6,5 @@ slurm/diffu*
 
 .venv/*
 .triton*/*
+submission/container.sif
+submission/*.tar.gz
