@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.triton*
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+trained_models
+data
+*.h5
+*.hdf5
+*.pth
+*.pt
+slurm/diffu*
+.claude

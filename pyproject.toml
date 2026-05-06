@@ -25,9 +25,10 @@ dependencies = [
   "optuna>=4.0.0", 
   "fvcore>=0.1.5", 
   "torchsde>=0.2.6",
-  "click>=8.0.1", 
+  "click>=8.0.1",
   "torchsde>=0.2.6",
-  "mplhep>=0.3.57"
+  "mplhep>=0.3.57",
+  "triton>=2.1.0; platform_system=='Linux'"
 ]
 
 [build-system]
